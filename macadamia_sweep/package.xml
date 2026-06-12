@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>macadamia_sweep</name>
+  <version>0.0.0</version>
+  <description>Simple single-row macadamia/chestnut demo</description>
+  <maintainer email="user@example.com">user</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
