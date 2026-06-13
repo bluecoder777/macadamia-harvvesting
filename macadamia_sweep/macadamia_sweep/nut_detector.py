@@ -167,9 +167,15 @@ class NutDetector(Node):
         self.detect_mode = str(self.get_parameter("detect_mode").value).lower()
 
         # ---- Shape / size gate ----
-        self.declare_parameter("min_area_px", 30.0)
+        self.declare_parameter("min_area_px", 12.0)
         self.declare_parameter("max_area_px", 1500.0)
-        self.declare_parameter("min_circularity", 0.70)   # 4*pi*A / P^2 (1.0 = perfect circle)
+        # Solidity = contour area / convex-hull area ("is it a FILLED blob?").
+        # This is FORESHORTENING-INVARIANT: the camera is horizontal at 0.19 m
+        # so a floor disc is viewed at a shallow angle and projects to an
+        # ELLIPSE (often very thin), not a circle -- circularity rejected those.
+        # A disc at any angle is a filled ellipse (solidity ~0.9); ragged or
+        # partial clutter scores lower.
+        self.declare_parameter("min_solidity", 0.80)
         # Range-AWARE physical-size gate (the strongest clutter rejector).
         # After the floor projection we know the range, so we check the blob's
         # REAL diameter (m), not just pixels. A nut is ~3 cm; a round piece of
@@ -203,7 +209,7 @@ class NutDetector(Node):
 
         self.min_area = float(self.get_parameter("min_area_px").value)
         self.max_area = float(self.get_parameter("max_area_px").value)
-        self.min_circularity = float(self.get_parameter("min_circularity").value)
+        self.min_solidity = float(self.get_parameter("min_solidity").value)
         self.min_nut_d = float(self.get_parameter("min_nut_diameter_m").value)
         self.max_nut_d = float(self.get_parameter("max_nut_diameter_m").value)
         self.use_depth_gate = bool(self.get_parameter("use_depth_gate").value)
@@ -314,34 +320,42 @@ class NutDetector(Node):
             return
 
         mask = self.colour_mask(bgr)
-        detections_px = self.find_nut_pixels(mask)
+        candidates = self.find_candidates(mask)   # (u, v, radius, shape_status)
 
-        # Project each pixel detection onto the floor in target_frame. The
+        # Project each shape-passing blob onto the floor in target_frame. The
         # camera->map transform is the same for every blob in this frame, so
         # look it up ONCE here rather than per blob.
         source_frame = msg.header.frame_id or "oak_rgb_camera_optical_frame"
         cam = self._lookup_camera_pose(source_frame, msg.header.stamp)
         poses: List[Pose] = []
-        accepted_px: List[Tuple[int, int, int]] = []  # (u, v, radius) for debug
+        # (u, v, radius, draw_status) -- "ok" green, "gate" orange, "shape" yellow.
+        draw: List[Tuple[int, int, int, str]] = []
+        n_shape_ok = sum(1 for c in candidates if c[3] == "ok")
 
         if cam is None:
-            if detections_px:
+            if n_shape_ok:
                 self.get_logger().warn(
-                    f"Saw {len(detections_px)} nut blob(s) but TF "
+                    f"Saw {n_shape_ok} nut blob(s) but TF "
                     f"{self.target_frame}<-{source_frame} was unavailable.",
                     throttle_duration_sec=5.0,
                 )
+            draw = [(u, v, r, "shape" if st != "ok" else "gate")
+                    for (u, v, r, st) in candidates]
         else:
             origin, R = cam
-            for (u, v, radius) in detections_px:
+            for (u, v, radius, st) in candidates:
+                if st != "ok":
+                    draw.append((u, v, radius, "shape"))
+                    continue
                 pt = self.project_and_gate(u, v, radius, origin, R)
                 if pt is None:
+                    draw.append((u, v, radius, "gate"))
                     continue
                 p = Pose()
                 p.position.x, p.position.y, p.position.z = pt
                 p.orientation.w = 1.0
                 poses.append(p)
-                accepted_px.append((u, v, radius))
+                draw.append((u, v, radius, "ok"))
 
         out = PoseArray()
         out.header.stamp = msg.header.stamp
@@ -350,7 +364,7 @@ class NutDetector(Node):
         self.det_pub.publish(out)
 
         if self.debug_pub is not None:
-            self.publish_debug_image(bgr, mask, detections_px, accepted_px, msg.header.stamp)
+            self.publish_debug_image(bgr, draw, msg.header.stamp)
 
     # -----------------------------
     # Vision
@@ -405,24 +419,38 @@ class NutDetector(Node):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         return mask
 
-    def find_nut_pixels(self, mask: np.ndarray) -> List[Tuple[int, int, int]]:
-        """Return (u, v, radius_px) for each blob that passes area + circularity."""
+    def find_candidates(self, mask: np.ndarray) -> List[Tuple[int, int, int, str]]:
+        """Return (u, v, radius_px, status) for every blob in the mask.
+
+        status is "ok" if it passes the area + solidity shape test, else the
+        reason it failed ("small" / "big" / "notsolid"). Reporting the failures
+        lets the debug image distinguish "in the mask but wrong shape" (drawn
+        yellow) from "not in the mask at all" (no circle).
+
+        Centre + radius come from a fitted ELLIPSE: the major axis of a flat
+        disc's projection stays ~ its true diameter even when foreshortened, so
+        the downstream physical-size gate works at any viewing angle."""
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        out: List[Tuple[int, int, int]] = []
+        out: List[Tuple[int, int, int, str]] = []
         for c in contours:
+            if len(c) >= 5:
+                (ex, ey), (ax1, ax2), _ = cv2.fitEllipse(c)
+                u, v, radius = int(round(ex)), int(round(ey)), int(round(max(ax1, ax2) / 2.0))
+            else:
+                (ex, ey), rr = cv2.minEnclosingCircle(c)
+                u, v, radius = int(round(ex)), int(round(ey)), int(round(rr))
             area = cv2.contourArea(c)
-            if area < self.min_area or area > self.max_area:
-                continue
-            perim = cv2.arcLength(c, True)
-            if perim <= 0:
-                continue
-            circularity = 4.0 * math.pi * area / (perim * perim)
-            if circularity < self.min_circularity:
-                continue
-            (u, v), radius = cv2.minEnclosingCircle(c)
-            out.append((int(round(u)), int(round(v)), int(round(radius))))
+            if area < self.min_area:
+                out.append((u, v, radius, "small")); continue
+            if area > self.max_area:
+                out.append((u, v, radius, "big")); continue
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            solidity = area / hull_area if hull_area > 0 else 0.0
+            if solidity < self.min_solidity:
+                out.append((u, v, radius, "notsolid")); continue
+            out.append((u, v, radius, "ok"))
         return out
 
     # -----------------------------
@@ -515,26 +543,32 @@ class NutDetector(Node):
     # Debug overlay
     # -----------------------------
 
-    def publish_debug_image(self, bgr, mask, all_px, accepted_px, stamp):
+    def publish_debug_image(self, bgr, draw, stamp):
         vis = bgr.copy()
         # Tint the selected/removed pixels so tuning is obvious: in background
-        # mode this is the FLOOR being subtracted (tune until all turf is
-        # tinted); in colour mode it's the selected nut hue.
-        tint = self._debug_tint if self._debug_tint is not None else mask
-        vis[tint > 0] = (0.45 * vis[tint > 0] + np.array([153, 60, 0])).astype(np.uint8)
+        # mode this is the FLOOR being subtracted (tune until all floor is
+        # tinted); in colour mode it's the selected nut hue. Magenta is chosen
+        # so it stays visible over a green OR blue floor.
+        tint = self._debug_tint
+        if tint is not None:
+            vis[tint > 0] = (0.5 * vis[tint > 0] + np.array([160, 0, 160])).astype(np.uint8)
         # Horizon / ROI line.
         roi_top = int(self.roi_top_fraction * bgr.shape[0])
         cv2.line(vis, (0, roi_top), (vis.shape[1], roi_top), (255, 255, 0), 1)
-        accepted_set = set((u, v) for (u, v, _) in accepted_px)
-        for (u, v, radius) in all_px:
-            ok = (u, v) in accepted_set  # passed shape AND projected in range
-            colour = (0, 255, 0) if ok else (0, 165, 255)
+        # Status colours: green = accepted nut, orange = passed shape but a
+        # gate rejected it, yellow = found in mask but wrong shape/size.
+        colours = {"ok": (0, 255, 0), "gate": (0, 165, 255), "shape": (0, 255, 255)}
+        n = {"ok": 0, "gate": 0, "shape": 0}
+        for (u, v, radius, st) in draw:
+            n[st] = n.get(st, 0) + 1
+            colour = colours.get(st, (0, 0, 255))
             cv2.circle(vis, (u, v), max(radius, 3), colour, 2)
             cv2.circle(vis, (u, v), 2, colour, -1)
         cv2.putText(
             vis,
-            f"{self._debug_tint_label} | blobs:{len(all_px)} accepted:{len(accepted_px)}",
-            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+            f"{self._debug_tint_label} | "
+            f"green(ok):{n['ok']} orange(gate):{n['gate']} yellow(shape):{n['shape']}",
+            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
         )
 
         out = Image()

@@ -43,10 +43,10 @@ sudo apt install python3-opencv python3-numpy
 - **`background`** (default) — nuts can be **any colour**; the detector subtracts the known **floor** colour (green astroturf) and keeps round, floor-sized blobs of whatever remains. Use this when nut colours vary. A green/lime nut would blend into the turf — avoid those.
 - **`color`** — all nuts share **one** colour; matches a single HSV hue band (two bands for red wrap). Set `detect_mode:=color`.
 
-In both modes the colour-independent **shape gate** (size + circularity) does the real discrimination, so it rejects noodle bases, walls and turf speckle regardless of nut colour.
+In both modes the colour-independent **shape gate** (size + **solidity**) does the real discrimination, so it rejects ragged/partial clutter regardless of nut colour. Solidity (filled-ness) is used instead of circularity because the low horizontal camera sees floor discs as foreshortened **ellipses**, not circles — solidity is invariant to that.
 
 ### Rejecting clutter (chairs, bags, cupboards)
-Five colour-independent gates stack, in order: horizon cut → pixel area → circularity → on-floor projection + range → **physical size (m)** → **depth on-floor**. The last two are the heavy lifters for furniture:
+Five colour-independent gates stack, in order: horizon cut → pixel area → **solidity** → on-floor projection + range → **physical size (m)** → **depth on-floor**. The last two are the heavy lifters for furniture:
 - **Physical-size**: after projection the range is known, so the blob's real diameter must be ~1.5–8 cm. A round chair wheel rarely is.
 - **Depth on-floor**: the aligned depth must agree the blob *lies on the floor*. A surface standing up (measured closer than the floor plane) is rejected — this targets furniture specifically, regardless of its colour. Textureless nuts that return no depth are accepted (the gate only rejects on positive evidence of standing-up geometry).
 
@@ -58,7 +58,9 @@ Watch it work on `/nuts/debug_image`: rejected blobs draw **orange**, accepted *
 ros2 launch macadamia_sweep nut_detection.launch.py
 ros2 run rqt_image_view rqt_image_view /nuts/debug_image
 ```
-On the debug image: **tinted pixels = floor being removed** (in background mode), cyan line = horizon/ROI cutoff (above it is ignored), green circles = accepted nuts, orange = blobs rejected by shape or range.
+On the debug image: **magenta-tinted pixels = floor being removed** (in background mode), cyan line = horizon/ROI cutoff (above it is ignored). Blob circles: **green** = accepted nut (published), **orange** = passed shape but a gate (size/range/depth) rejected it, **yellow** = found in the mask but wrong shape/size, **no circle** = not in the mask at all. The label counts each. So `green` high = good; `yellow` high = relax `min_solidity` / `min_area_px`; `orange` high = relax a gate; nothing circled = fix the floor mask.
+
+> Note: the camera is horizontal at 0.19 m, so floor discs are foreshortened into ellipses, not circles. The shape gate therefore uses **solidity** (filled-ness, invariant to viewing angle), not circularity. If distant nuts come up yellow, lower `min_solidity` (e.g. 0.7).
 
 Background mode — tune until **all the astroturf is tinted** but the nuts are NOT:
 ```bash
@@ -96,7 +98,7 @@ PY
 - `detect_mode` — `background` (subtract floor, any nut colour) or `color` (single nut hue).
 - `floor_h_lo/floor_h_hi`, `floor_s_min`, `floor_v_min/floor_v_max` — floor (astroturf) colour to subtract in **background** mode.
 - `h_lo1/h_hi1`, `h_lo2/h_hi2`, `s_min/s_max`, `v_min/v_max` — HSV nut gate in **color** mode (two hue bands for red wrap).
-- `min_area_px` / `max_area_px`, `min_circularity` — shape gate (colour-independent; the real nut/not-nut discriminator).
+- `min_area_px` / `max_area_px`, `min_solidity` — shape gate (colour-independent; the real nut/not-nut discriminator). Solidity = filled-ness, robust to the foreshortened-ellipse look of floor discs.
 - `min_nut_diameter_m` / `max_nut_diameter_m` (0.015 / 0.08) — range-aware **physical-size** gate: real diameter must be nut-sized.
 - `use_depth_gate` (true), `depth_topic`, `depth_floor_tolerance` (0.10 m) — **depth on-floor** gate: rejects surfaces standing up off the floor (chairs/bags/cupboards). Set `use_depth_gate:=false` to A/B it.
 - `roi_top_fraction` (0.45) — ignore image above the horizon.
