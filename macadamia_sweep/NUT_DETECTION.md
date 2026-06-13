@@ -115,5 +115,44 @@ PY
 - `/nuts/uncollected` — `geometry_msgs/PoseArray`, **latched** (transient-local). A picker node started later still receives the full list. Plan a route over these (a TSP / coverage problem).
 - `~/nut_locations.csv` — `id, x_map, y_map, collected, hits`, written on Ctrl-C.
 
+## Verifying collection (pickup) works
+
+"Picked up" = the tracker flipped a nut from uncollected→collected because `base_link` passed within `collection_radius`. Verify it in this order.
+
+### RViz
+```bash
+rviz2 -d $(ros2 pkg prefix macadamia_sweep)/share/macadamia_sweep/rviz/nuts.rviz
+# or from the source tree: rviz2 -d macadamia_sweep/rviz/nuts.rviz
+```
+The config sets **Fixed Frame = map** and shows: `/nuts/markers` (spheres), `/nuts/debug_image`, `/nuts/uncollected` (red arrows), `/map`, `/scan`, TF. If you build the displays by hand instead, the only non-obvious settings are: Map and `/nuts/uncollected` need **Durability = Transient Local**, and `/scan` needs **Reliability = Best Effort**.
+
+What you should see: a nut appears as a **RED sphere**, and when the robot drives over it the sphere turns **GREEN** and the floating `collected X/Y` label increments.
+
+### Controlled test (no camera needed)
+Isolates the tracker/collection logic from HSV tuning:
+```bash
+ros2 run macadamia_sweep nut_tracker                 # if not already running
+python3 tools/inject_fake_nuts.py --ahead 0.6        # drops a fake nut 0.6 m ahead
+```
+Watch a RED sphere appear ~0.6 m in front of the robot. Then teleop forward over it:
+```bash
+ros2 topic echo /snc_status      # should go "...collected 1 / total 1"
+```
+The sphere should turn GREEN as `base_link` crosses within `collection_radius`.
+
+### Cross-checks (terminal)
+```bash
+ros2 topic echo /nuts/detections   # raw per-frame detections (map frame)
+ros2 topic echo /snc_status        # "Nuts: collected X / total Y"
+ros2 topic echo /nuts/uncollected  # shrinks by one each time a nut is collected
+cat ~/nut_locations.csv            # on shutdown: id,x,y,collected,hits
+```
+
+### If a nut never turns green
+- `collection_radius` too small for how close you actually drive → raise it (`ros2 param set /nut_tracker collection_radius 0.30`).
+- The nut never **confirmed** (needs `min_hits=3` sightings) → it won't show or collect; lower `min_hits` or dwell on it longer.
+- TF `map→base_link` not available to the tracker → no robot pose, no collection. Check `ros2 run tf2_ros tf2_echo map base_link`.
+- Detections arriving in a frame other than `map` → tracker ignores them (it warns).
+
 ## Note on running with the row follower
 `simple_row_follower` and Nav2 both drive `/cmd_vel_nav` — run only one of them at a time. The nut nodes are **read-only** w.r.t. motion (they never publish velocity), so they're safe to run alongside either.
