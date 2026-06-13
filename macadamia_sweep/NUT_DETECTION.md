@@ -99,7 +99,8 @@ PY
 - `floor_h_lo/floor_h_hi`, `floor_s_min`, `floor_v_min/floor_v_max` — floor (astroturf) colour to subtract in **background** mode.
 - `h_lo1/h_hi1`, `h_lo2/h_hi2`, `s_min/s_max`, `v_min/v_max` — HSV nut gate in **color** mode (two hue bands for red wrap).
 - `min_area_px` / `max_area_px`, `min_solidity` — shape gate (colour-independent; the real nut/not-nut discriminator). Solidity = filled-ness, robust to the foreshortened-ellipse look of floor discs.
-- `min_nut_diameter_m` / `max_nut_diameter_m` (0.015 / 0.08) — range-aware **physical-size** gate: real diameter must be nut-sized.
+- `min_nut_diameter_m` / `max_nut_diameter_m` (0.015 / 0.05) — range-aware **physical-size** gate: real diameter must be nut-sized. The 5 cm cap rejects 6 cm noodle bases.
+- `morph_px` (3) — morphology kernel size. Keep small: a large kernel erodes the thin foreshortened nut ellipses away. Raise only for a noisy floor.
 - `use_depth_gate` (true), `depth_topic`, `depth_floor_tolerance` (0.10 m) — **depth on-floor** gate: rejects surfaces standing up off the floor (chairs/bags/cupboards). Set `use_depth_gate:=false` to A/B it.
 - `roi_top_fraction` (0.45) — ignore image above the horizon.
 - `min_range` / `max_range` (0.30 / 2.50 m) — reject too-near/too-far projections.

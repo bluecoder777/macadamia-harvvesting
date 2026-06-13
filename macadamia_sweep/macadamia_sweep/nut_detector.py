@@ -178,10 +178,11 @@ class NutDetector(Node):
         self.declare_parameter("min_solidity", 0.80)
         # Range-AWARE physical-size gate (the strongest clutter rejector).
         # After the floor projection we know the range, so we check the blob's
-        # REAL diameter (m), not just pixels. A nut is ~3 cm; a round piece of
-        # furniture on the floor is rarely also 1.5-8 cm across.
+        # REAL diameter (m), not just pixels. A nut is ~3 cm; the cap is 5 cm so
+        # a 6 cm noodle BASE (which sits on the floor and otherwise passes every
+        # gate) is rejected.
         self.declare_parameter("min_nut_diameter_m", 0.015)
-        self.declare_parameter("max_nut_diameter_m", 0.08)
+        self.declare_parameter("max_nut_diameter_m", 0.05)
 
         # ---- Depth on-floor gate (rejects things standing UP off the floor:
         # chairs, bags, cupboards) ----
@@ -197,6 +198,10 @@ class NutDetector(Node):
         # and walls/noodles above it). Camera is horizontal so the horizon is
         # at v=cy~206 of 432 ~ 0.48; 0.45 trims just above it.
         self.declare_parameter("roi_top_fraction", 0.45)
+        # Morphology kernel (px). SMALL (3) preserves the thin, foreshortened
+        # nut ellipses the low horizontal camera sees. Raise only for a noisy
+        # floor (e.g. turf) -- but a big kernel erodes shallow-angle nuts away.
+        self.declare_parameter("morph_px", 3)
 
         # ---- Range gate (m, horizontal distance camera->nut in target_frame) ----
         self.declare_parameter("min_range", 0.30)
@@ -216,6 +221,7 @@ class NutDetector(Node):
         self.depth_topic = self.get_parameter("depth_topic").value
         self.depth_floor_tol = float(self.get_parameter("depth_floor_tolerance").value)
         self.roi_top_fraction = float(self.get_parameter("roi_top_fraction").value)
+        self.morph_px = max(1, int(self.get_parameter("morph_px").value))
         self.min_range = float(self.get_parameter("min_range").value)
         self.max_range = float(self.get_parameter("max_range").value)
         self.process_every_n = max(1, int(self.get_parameter("process_every_n").value))
@@ -393,9 +399,6 @@ class NutDetector(Node):
             mask = cv2.bitwise_not(floor)
             self._debug_tint = floor
             self._debug_tint_label = "floor removed"
-            # Bigger kernel: turf blades produce fine non-green speckle that an
-            # open() must erase before it survives as a "blob".
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         else:
             # Single-hue gate: nuts share one colour (two bands for red wrap).
             s_min = int(self.get_parameter("s_min").value)
@@ -409,12 +412,14 @@ class NutDetector(Node):
             mask = cv2.inRange(hsv, lo1, hi1) | cv2.inRange(hsv, lo2, hi2)
             self._debug_tint = mask
             self._debug_tint_label = "nut colour"
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
         # Kill the horizon and everything above it (walls, noodles, ceiling).
         if roi_top > 0:
             mask[:roi_top, :] = 0
 
+        # Gentle morphology: a SMALL kernel removes speckle without eroding the
+        # thin, foreshortened nut ellipses the low horizontal camera sees.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.morph_px, self.morph_px))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         return mask
