@@ -23,8 +23,12 @@ cd ~/your_ros2_ws            # the workspace this package lives in
 colcon build --packages-select macadamia_sweep
 source install/setup.bash
 
-# perception + tracker together:
+# perception + tracker only:
 ros2 launch macadamia_sweep nut_detection.launch.py
+
+# OR the whole mission -- sweep + detect + track in one launch, then trigger:
+ros2 launch macadamia_sweep sweep_and_detect.launch.py
+ros2 topic pub --once /sweep_start std_msgs/msg/Empty "{}"
 
 # in RViz: add a MarkerArray display on /nuts/markers, Fixed Frame = map
 #   RED sphere   = uncollected nut
