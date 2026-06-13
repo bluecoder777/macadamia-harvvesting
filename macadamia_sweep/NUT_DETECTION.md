@@ -1,0 +1,110 @@
+# Nut detection & collection tracking
+
+Two nodes, added to the `macadamia_sweep` package:
+
+| Node | Layer | Role |
+|------|-------|------|
+| `nut_detector` | Perception | RGB → HSV colour mask → circular blobs → ground-plane projection → `/nuts/detections` (PoseArray in `map`). Stateless per frame. |
+| `nut_tracker` | World model / mission | De-dups detections into unique nuts, marks them **collected** when the robot drives over them, publishes RViz spheres + a saved list of uncollected nuts. |
+
+This is the **three-layer** split: perception (`nut_detector`) → world model + mission state (`nut_tracker`) → reactive control (`simple_row_follower`).
+
+## Why these design choices (from the robot's real setup)
+
+- **Camera is horizontal at 0.192 m, no tilt** → floor visible from ~0.55 m ahead, blind cone underneath. We localise each nut while it's ahead and remember it, so the "drive-over = collected" check works without seeing under the robot.
+- **Detect on `/oak/rgb/image_rect`** (rectified) → matches `camera_info` `K` with zero distortion, so the pinhole projection is exact.
+- **Ground-plane ray intersection, not depth.** OAK-D stereo holes out on flat textureless cardboard; intersecting the pixel ray with the floor (`z=0` in `map`, via TF) is more robust and needs only RGB + `camera_info` + TF.
+- **Classic HSV+contour CV** (no YOLO) → runs fine on the Pi 5; deterministic and tunable.
+
+## Build & run
+
+```bash
+cd ~/your_ros2_ws            # the workspace this package lives in
+colcon build --packages-select macadamia_sweep
+source install/setup.bash
+
+# perception + tracker together:
+ros2 launch macadamia_sweep nut_detection.launch.py
+
+# in RViz: add a MarkerArray display on /nuts/markers, Fixed Frame = map
+#   RED sphere   = uncollected nut
+#   GREEN sphere = collected nut (robot drove within collection_radius)
+```
+
+Dependencies: `python3-opencv`, `python3-numpy` (no `cv_bridge` needed — images are decoded directly). If missing:
+```bash
+sudo apt install python3-opencv python3-numpy
+```
+
+## Two detection modes
+
+`detect_mode` parameter:
+
+- **`background`** (default) — nuts can be **any colour**; the detector subtracts the known **floor** colour (green astroturf) and keeps round, floor-sized blobs of whatever remains. Use this when nut colours vary. A green/lime nut would blend into the turf — avoid those.
+- **`color`** — all nuts share **one** colour; matches a single HSV hue band (two bands for red wrap). Set `detect_mode:=color`.
+
+In both modes the colour-independent **shape gate** (size + circularity) does the real discrimination, so it rejects noodle bases, walls and turf speckle regardless of nut colour.
+
+## Calibrate (do this once)
+
+```bash
+ros2 launch macadamia_sweep nut_detection.launch.py
+ros2 run rqt_image_view rqt_image_view /nuts/debug_image
+```
+On the debug image: **tinted pixels = floor being removed** (in background mode), cyan line = horizon/ROI cutoff (above it is ignored), green circles = accepted nuts, orange = blobs rejected by shape or range.
+
+Background mode — tune until **all the astroturf is tinted** but the nuts are NOT:
+```bash
+ros2 param set /nut_detector floor_h_lo 30     # widen the green hue range
+ros2 param set /nut_detector floor_h_hi 95
+ros2 param set /nut_detector floor_s_min 20    # lower to swallow shadowed/pale turf
+ros2 param set /nut_detector floor_v_min 15
+```
+If turf speckle still sneaks through as tiny blobs, raise `min_area_px`. When happy, copy the values into `nut_detection.launch.py` (or a params yaml).
+
+### Get me a frame to pre-tune the HSV for you
+You recorded `nut_sample`. Extract one RGB frame and send it:
+```bash
+# play the bag and save one frame
+ros2 bag play nut_sample &
+ros2 run image_view image_saver --ros-args -r image:=/oak/rgb/image_rect \
+    -p filename_format:='nut_%04d.jpg'   # Ctrl-C after a couple of frames
+# (image_view not installed? quick alternative:)
+python3 - <<'PY'
+import rclpy, numpy as np, cv2
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+rclpy.init(); n=Node("grab")
+def cb(m):
+    a=np.frombuffer(m.data,np.uint8).reshape(m.height,m.step)[:, :m.width*3].reshape(m.height,m.width,3)
+    if m.encoding=='rgb8': a=a[:,:,::-1]
+    cv2.imwrite('nut_frame.png', a); print('wrote nut_frame.png'); rclpy.shutdown()
+n.create_subscription(Image,'/oak/rgb/image_rect',cb,1); rclpy.spin(n)
+PY
+```
+
+## Key parameters
+
+`nut_detector`:
+- `detect_mode` — `background` (subtract floor, any nut colour) or `color` (single nut hue).
+- `floor_h_lo/floor_h_hi`, `floor_s_min`, `floor_v_min/floor_v_max` — floor (astroturf) colour to subtract in **background** mode.
+- `h_lo1/h_hi1`, `h_lo2/h_hi2`, `s_min/s_max`, `v_min/v_max` — HSV nut gate in **color** mode (two hue bands for red wrap).
+- `min_area_px` / `max_area_px`, `min_circularity` — shape gate (colour-independent; the real nut/not-nut discriminator).
+- `roi_top_fraction` (0.45) — ignore image above the horizon.
+- `min_range` / `max_range` (0.30 / 2.50 m) — reject too-near/too-far projections.
+- `process_every_n` (2) — throttle vs the ~14 Hz camera.
+
+`nut_tracker`:
+- `merge_radius` (0.15 m) — two detections within this are the same nut.
+- `min_hits` (3) — sightings before a nut is confirmed/shown.
+- `collection_radius` (0.25 m) — robot within this of a nut → collected. Set to your sweeper/footprint half-width.
+- `marker_diameter` (0.08 m) — sphere size in RViz.
+- `save_path` (`~/nut_locations.csv`) — written on shutdown.
+
+## Outputs (for the later "collect all uncollected in one sweep" phase)
+
+- `/nuts/uncollected` — `geometry_msgs/PoseArray`, **latched** (transient-local). A picker node started later still receives the full list. Plan a route over these (a TSP / coverage problem).
+- `~/nut_locations.csv` — `id, x_map, y_map, collected, hits`, written on Ctrl-C.
+
+## Note on running with the row follower
+`simple_row_follower` and Nav2 both drive `/cmd_vel_nav` — run only one of them at a time. The nut nodes are **read-only** w.r.t. motion (they never publish velocity), so they're safe to run alongside either.

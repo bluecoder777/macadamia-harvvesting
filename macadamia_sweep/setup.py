@@ -24,6 +24,8 @@ setup(
         'console_scripts': [
     'simple_row_follower = macadamia_sweep.simple_row_follower:main',
     'sweep_logger = macadamia_sweep.sweep_logger:main',
+    'nut_detector = macadamia_sweep.nut_detector:main',
+    'nut_tracker = macadamia_sweep.nut_tracker:main',
 ],
     },
 )
