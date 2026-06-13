@@ -176,6 +176,11 @@ class NutDetector(Node):
         # A disc at any angle is a filled ellipse (solidity ~0.9); ragged or
         # partial clutter scores lower.
         self.declare_parameter("min_solidity", 0.80)
+        # Circularity measured in the GROUND PLANE (Option A). After projecting
+        # a blob's contour onto the floor, a real disc is a true circle
+        # (circularity ~1) regardless of camera angle -- the angle-invariant
+        # roundness test that replaces judging shape in the distorted image.
+        self.declare_parameter("min_metric_circularity", 0.65)
         # Range-AWARE physical-size gate (the strongest clutter rejector).
         # After the floor projection we know the range, so we check the blob's
         # REAL diameter (m), not just pixels. A nut is ~3 cm; the cap is 5 cm so
@@ -215,6 +220,9 @@ class NutDetector(Node):
         self.min_area = float(self.get_parameter("min_area_px").value)
         self.max_area = float(self.get_parameter("max_area_px").value)
         self.min_solidity = float(self.get_parameter("min_solidity").value)
+        self.min_metric_circularity = float(
+            self.get_parameter("min_metric_circularity").value
+        )
         self.min_nut_d = float(self.get_parameter("min_nut_diameter_m").value)
         self.max_nut_d = float(self.get_parameter("max_nut_diameter_m").value)
         self.use_depth_gate = bool(self.get_parameter("use_depth_gate").value)
@@ -326,42 +334,29 @@ class NutDetector(Node):
             return
 
         mask = self.colour_mask(bgr)
-        candidates = self.find_candidates(mask)   # (u, v, radius, shape_status)
 
-        # Project each shape-passing blob onto the floor in target_frame. The
-        # camera->map transform is the same for every blob in this frame, so
-        # look it up ONCE here rather than per blob.
+        # The camera->target_frame transform is the same for every blob in this
+        # frame, so look it up ONCE.
         source_frame = msg.header.frame_id or "oak_rgb_camera_optical_frame"
         cam = self._lookup_camera_pose(source_frame, msg.header.stamp)
-        poses: List[Pose] = []
-        # (u, v, radius, draw_status) -- "ok" green, "gate" orange, "shape" yellow.
-        draw: List[Tuple[int, int, int, str]] = []
-        n_shape_ok = sum(1 for c in candidates if c[3] == "ok")
 
-        if cam is None:
-            if n_shape_ok:
-                self.get_logger().warn(
-                    f"Saw {n_shape_ok} nut blob(s) but TF "
-                    f"{self.target_frame}<-{source_frame} was unavailable.",
-                    throttle_duration_sec=5.0,
-                )
-            draw = [(u, v, r, "shape" if st != "ok" else "gate")
-                    for (u, v, r, st) in candidates]
-        else:
-            origin, R = cam
-            for (u, v, radius, st) in candidates:
-                if st != "ok":
-                    draw.append((u, v, radius, "shape"))
-                    continue
-                pt = self.project_and_gate(u, v, radius, origin, R)
-                if pt is None:
-                    draw.append((u, v, radius, "gate"))
-                    continue
-                p = Pose()
-                p.position.x, p.position.y, p.position.z = pt
-                p.orientation.w = 1.0
-                poses.append(p)
-                draw.append((u, v, radius, "ok"))
+        points, draw = self.detect_nuts(mask, cam)
+
+        if cam is None and draw:
+            self.get_logger().warn(
+                f"Saw {len(draw)} blob(s) but TF "
+                f"{self.target_frame}<-{source_frame} was unavailable.",
+                throttle_duration_sec=5.0,
+            )
+
+        poses: List[Pose] = []
+        for (x, y) in points:
+            p = Pose()
+            p.position.x = x
+            p.position.y = y
+            p.position.z = self.ground_z
+            p.orientation.w = 1.0
+            poses.append(p)
 
         out = PoseArray()
         out.header.stamp = msg.header.stamp
@@ -424,39 +419,77 @@ class NutDetector(Node):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         return mask
 
-    def find_candidates(self, mask: np.ndarray) -> List[Tuple[int, int, int, str]]:
-        """Return (u, v, radius_px, status) for every blob in the mask.
+    def detect_nuts(self, mask: np.ndarray, cam):
+        """Find blobs and judge each in METRIC ground-plane space (Option A).
 
-        status is "ok" if it passes the area + solidity shape test, else the
-        reason it failed ("small" / "big" / "notsolid"). Reporting the failures
-        lets the debug image distinguish "in the mask but wrong shape" (drawn
-        yellow) from "not in the mask at all" (no circle).
+        A flat disc viewed at a shallow angle is a thin ellipse in the IMAGE,
+        but projecting its contour onto the floor un-distorts it back into a
+        true circle. So circularity AND diameter are tested in METRES, which is
+        invariant to viewing angle -- fixing the "sees the marker, calls it
+        not-a-marker" failure. Cheap pixel pre-filters (area, solidity) reject
+        obvious noise before the projection.
 
-        Centre + radius come from a fitted ELLIPSE: the major axis of a flat
-        disc's projection stays ~ its true diameter even when foreshortened, so
-        the downstream physical-size gate works at any viewing angle."""
+        Returns (points, draw):
+          points -- list of (x, y) accepted nut centres in target_frame
+          draw   -- list of (u, v, radius_px, status) for the debug overlay,
+                    status in {"ok" green, "gate" orange, "shape" yellow}.
+        """
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        out: List[Tuple[int, int, int, str]] = []
+        points: List[Tuple[float, float]] = []
+        draw: List[Tuple[int, int, int, str]] = []
+        origin = R = None
+        if cam is not None:
+            origin, R = cam
+
         for c in contours:
-            if len(c) >= 5:
-                (ex, ey), (ax1, ax2), _ = cv2.fitEllipse(c)
-                u, v, radius = int(round(ex)), int(round(ey)), int(round(max(ax1, ax2) / 2.0))
-            else:
-                (ex, ey), rr = cv2.minEnclosingCircle(c)
-                u, v, radius = int(round(ex)), int(round(ey)), int(round(rr))
-            area = cv2.contourArea(c)
-            if area < self.min_area:
-                out.append((u, v, radius, "small")); continue
-            if area > self.max_area:
-                out.append((u, v, radius, "big")); continue
+            (pu, pv), prad = cv2.minEnclosingCircle(c)
+            u, v, radius = int(round(pu)), int(round(pv)), int(round(prad))
+
+            # --- cheap pixel pre-filters (reject noise before projecting) ---
+            area_px = cv2.contourArea(c)
+            if area_px < self.min_area:
+                draw.append((u, v, radius, "shape")); continue
             hull_area = cv2.contourArea(cv2.convexHull(c))
-            solidity = area / hull_area if hull_area > 0 else 0.0
+            solidity = area_px / hull_area if hull_area > 0 else 0.0
             if solidity < self.min_solidity:
-                out.append((u, v, radius, "notsolid")); continue
-            out.append((u, v, radius, "ok"))
-        return out
+                draw.append((u, v, radius, "shape")); continue
+
+            if origin is None:                 # no TF -> can't judge metrically
+                draw.append((u, v, radius, "gate")); continue
+
+            # --- project the contour onto the floor; judge in METRES ---
+            poly = self._project_pixels_to_ground(
+                c.reshape(-1, 2).astype(float), origin, R)
+            if poly is None:                   # straddles horizon -> not on floor
+                draw.append((u, v, radius, "gate")); continue
+            m_area, m_perim, cx, cy = self._polygon_metrics(poly)
+            if m_area <= 0.0 or m_perim <= 0.0:
+                draw.append((u, v, radius, "gate")); continue
+
+            rng = math.hypot(cx - origin[0], cy - origin[1])
+            if rng < self.min_range or rng > self.max_range:
+                draw.append((u, v, radius, "gate")); continue
+
+            eq_diam = 2.0 * math.sqrt(m_area / math.pi)   # equivalent disc diameter
+            if eq_diam < self.min_nut_d or eq_diam > self.max_nut_d:
+                draw.append((u, v, radius, "gate")); continue
+
+            circularity = 4.0 * math.pi * m_area / (m_perim * m_perim)
+            if circularity < self.min_metric_circularity:
+                draw.append((u, v, radius, "shape")); continue
+
+            # --- depth on-floor gate (reject objects standing up off the floor) ---
+            if self.use_depth_gate:
+                s_pred = self._forward_depth(u, v, origin, R)
+                if s_pred is not None and not self._depth_on_floor(u, v, s_pred, radius):
+                    draw.append((u, v, radius, "gate")); continue
+
+            points.append((cx, cy))
+            draw.append((u, v, radius, "ok"))
+
+        return points, draw
 
     # -----------------------------
     # Geometry: pixel -> floor point in target_frame
@@ -483,44 +516,47 @@ class NutDetector(Node):
         origin = np.array([t.x, t.y, t.z], dtype=float)
         return origin, R
 
-    def project_and_gate(
-        self, u: int, v: int, radius_px: float, origin: np.ndarray, R: np.ndarray
-    ) -> Optional[Tuple[float, float, float]]:
-        """Intersect the camera ray through pixel (u,v) with the floor plane
-        z = ground_z, then apply the range, physical-size and depth-on-floor
-        gates. origin/R are the camera pose in target_frame. Returns (x,y,z)."""
-        # Ray direction in the optical frame (z forward, x right, y down). Its
-        # z-component is 1, so the scalar `s` below is also the forward optical
-        # depth to the floor point -- which is exactly what a depth image
-        # measures (used by the depth gate).
-        d_opt = np.array(
-            [(u - self.cx) / self.fx, (v - self.cy) / self.fy, 1.0], dtype=float
-        )
+    def _project_pixels_to_ground(self, pix: np.ndarray, origin: np.ndarray, R: np.ndarray):
+        """Project an Nx2 array of (u,v) pixels onto the floor plane z=ground_z
+        in target_frame (vectorised). Returns Nx2 (x,y), or None if any ray
+        fails to hit the floor ahead -- i.e. the blob is not wholly on the
+        ground (part of it is above the horizon: a standing object)."""
+        dx = (pix[:, 0] - self.cx) / self.fx
+        dy = (pix[:, 1] - self.cy) / self.fy
+        d_opt = np.stack([dx, dy, np.ones_like(dx)], axis=1)   # Nx3 optical rays
+        d_map = d_opt @ R.T                                    # Nx3 in target_frame
+        dz = d_map[:, 2]
+        if np.any(dz >= -1e-6):        # a ray not heading down -> not on the floor
+            return None
+        s = (self.ground_z - origin[2]) / dz                  # N
+        if np.any(s <= 0):
+            return None
+        pts = origin.reshape(1, 3) + s.reshape(-1, 1) * d_map  # Nx3
+        return pts[:, :2]
+
+    @staticmethod
+    def _polygon_metrics(poly: np.ndarray):
+        """(area, perimeter, cx, cy) of a closed polygon (Nx2) via the shoelace
+        formula. Area is unsigned; centroid is area-weighted."""
+        x = poly[:, 0]; y = poly[:, 1]
+        x2 = np.roll(x, -1); y2 = np.roll(y, -1)
+        cross = x * y2 - x2 * y
+        signed_area = 0.5 * float(np.sum(cross))
+        perim = float(np.sum(np.hypot(x2 - x, y2 - y)))
+        if abs(signed_area) < 1e-12:
+            return 0.0, perim, float(np.mean(x)), float(np.mean(y))
+        cx = float(np.sum((x + x2) * cross) / (6.0 * signed_area))
+        cy = float(np.sum((y + y2) * cross) / (6.0 * signed_area))
+        return abs(signed_area), perim, cx, cy
+
+    def _forward_depth(self, u: float, v: float, origin: np.ndarray, R: np.ndarray):
+        """Forward optical depth (m) to the floor at pixel (u,v) -- the scalar a
+        depth image reports there. None if the ray doesn't hit the floor ahead."""
+        d_opt = np.array([(u - self.cx) / self.fx, (v - self.cy) / self.fy, 1.0])
         d_map = R @ d_opt
-        if d_map[2] >= -1e-6:          # ray must head DOWN toward the floor
+        if d_map[2] >= -1e-6:
             return None
-        s = (self.ground_z - origin[2]) / d_map[2]
-        if s <= 0:
-            return None
-        point = origin + s * d_map
-
-        # Range gate (horizontal distance camera->nut).
-        rng = math.hypot(point[0] - origin[0], point[1] - origin[1])
-        if rng < self.min_range or rng > self.max_range:
-            return None
-
-        # Range-aware physical-size gate: real diameter = 2*radius_px * R / fx,
-        # using slant range as the pixel->metre scale.
-        slant = math.hypot(rng, origin[2] - self.ground_z)
-        diameter_m = 2.0 * radius_px * slant / self.fx
-        if diameter_m < self.min_nut_d or diameter_m > self.max_nut_d:
-            return None
-
-        # Depth on-floor gate: reject surfaces standing up in front of the floor.
-        if self.use_depth_gate and not self._depth_on_floor(u, v, s, radius_px):
-            return None
-
-        return (float(point[0]), float(point[1]), float(point[2]))
+        return (self.ground_z - origin[2]) / d_map[2]
 
     def _depth_on_floor(self, u: int, v: int, s_pred: float, radius_px: float) -> bool:
         """True if the measured depth at the blob is consistent with it lying

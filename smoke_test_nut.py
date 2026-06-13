@@ -171,7 +171,10 @@ def make_detector(use_depth=False, depth_img=None):
     d.fx, d.fy, d.cx, d.cy = FX, FY, CX, CY
     d.ground_z = 0.0
     d.min_range, d.max_range = 0.30, 2.50
-    d.min_nut_d, d.max_nut_d = 0.015, 0.08
+    d.min_nut_d, d.max_nut_d = 0.015, 0.05
+    d.min_area = 12.0
+    d.min_solidity = 0.80
+    d.min_metric_circularity = 0.65
     d.use_depth_gate = use_depth
     d._depth_m = depth_img
     d.depth_floor_tol = 0.10
@@ -210,70 +213,81 @@ print(f"  camera origin in map = [{origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.
 check("camera height == 0.192 m", approx(origin[2], 0.192, 1e-3),
       f"z={origin[2]:.4f}")
 
-# Put a nut on the floor ~0.8 m ahead along the camera's forward azimuth.
+# Lay a TRUE 3 cm circle flat on the floor ~1.0 m ahead, sample its rim, and
+# project each rim point INTO the image -> the marker's pixel contour.
+det = make_detector(use_depth=False)
 fwd = R_mo @ np.array([0.0, 0.0, 1.0])
 az = math.atan2(fwd[1], fwd[0])
-P = np.array([origin[0] + 0.8 * math.cos(az),
-              origin[1] + 0.8 * math.sin(az),
-              0.0])
-u, v, Z = project_into_image(P, origin, R_mo)
-print(f"  nut@map=({P[0]:.3f},{P[1]:.3f},0) -> pixel=({u:.1f},{v:.1f}), opticalZ={Z:.3f}")
-check("pixel inside 768x432 image", 0 <= u <= 768 and 0 <= v <= 432, f"u={u:.1f} v={v:.1f}")
-check("floor point is below horizon (v>cy)", v > CY, f"v={v:.1f} cy={CY:.1f}")
+Pc = np.array([origin[0] + 1.0 * math.cos(az), origin[1] + 1.0 * math.sin(az), 0.0])
+NUT_R = 0.015                         # 3 cm diameter disc
+thetas = np.linspace(0.0, 2.0 * math.pi, 48, endpoint=False)
+rim_map = np.array([[Pc[0] + NUT_R * math.cos(t), Pc[1] + NUT_R * math.sin(t), 0.0]
+                    for t in thetas])
+pix = np.array([project_into_image(p, origin, R_mo)[:2] for p in rim_map])   # Nx2 (u,v)
 
-det = make_detector(use_depth=False)
-slant = float(np.linalg.norm(P - origin))
-radius_px = FX * 0.015 / slant       # a real 3 cm nut at this range
-res = det.project_and_gate(u, v, radius_px, origin, R_mo)
-check("project_and_gate returns a point", res is not None)
-if res is not None:
-    err = math.hypot(res[0] - P[0], res[1] - P[1])
-    print(f"  recovered=({res[0]:.3f},{res[1]:.3f},{res[2]:.3f})  err={err*1000:.2f} mm")
-    check("round-trip recovers nut within 2 mm", err < 0.002, f"err={err*1000:.3f} mm")
-    check("recovered z == floor (0)", approx(res[2], 0.0, 1e-6))
+# In the IMAGE the marker is a foreshortened ellipse -> LOW circularity (the bug).
+pa, pp, _, _ = ND.NutDetector._polygon_metrics(pix)
+pix_circ = 4.0 * math.pi * pa / (pp * pp)
+print(f"  pixel-space circularity = {pix_circ:.3f}  (foreshortened ellipse, expect < 0.7)")
+check("marker looks NON-circular in the image (the problem)", pix_circ < 0.7, f"{pix_circ:.3f}")
+
+# Option A: project the contour to the floor -> a TRUE circle in METRES (the fix).
+poly = det._project_pixels_to_ground(pix, origin, R_mo)
+check("contour projects onto the floor", poly is not None)
+m_area, m_perim, cx, cy = ND.NutDetector._polygon_metrics(poly)
+m_circ = 4.0 * math.pi * m_area / (m_perim * m_perim)
+eq_diam = 2.0 * math.sqrt(m_area / math.pi)
+err = math.hypot(cx - Pc[0], cy - Pc[1])
+print(f"  metric: diameter={eq_diam*100:.2f} cm  circularity={m_circ:.3f}  "
+      f"centre_err={err*1000:.2f} mm")
+check("metric circularity ~1 (un-distorted back to a circle)", m_circ > 0.95, f"{m_circ:.3f}")
+check("metric diameter == 3 cm (+/-3 mm)", approx(eq_diam, 0.03, 0.003), f"{eq_diam*100:.2f} cm")
+check("metric centre recovers the nut within 3 mm", err < 0.003, f"{err*1000:.2f} mm")
 
 # ===========================================================================
-print("=== nut_detector: gates ===")
-# Oversized blob (e.g. a chair part projected to floor): big pixel radius.
-big = det.project_and_gate(u, v, FX * 0.15 / slant, origin, R_mo)
-check("physical-size gate rejects 0.30 m blob", big is None)
+print("=== nut_detector: metric gates ===")
+# Oversized: a 0.10 m disc on the floor -> exceeds the 5 cm diameter cap.
+rimL = np.array([[Pc[0] + 0.05 * math.cos(t), Pc[1] + 0.05 * math.sin(t), 0.0] for t in thetas])
+pixL = np.array([project_into_image(p, origin, R_mo)[:2] for p in rimL])
+polyL = det._project_pixels_to_ground(pixL, origin, R_mo)
+aL, _, _, _ = ND.NutDetector._polygon_metrics(polyL)
+check("0.10 m disc exceeds the 5 cm cap", 2.0 * math.sqrt(aL / math.pi) > det.max_nut_d,
+      f"{2.0*math.sqrt(aL/math.pi)*100:.1f} cm")
 
-# Tiny speck below the min diameter.
-tiny = det.project_and_gate(u, v, FX * 0.005 / slant, origin, R_mo)
-check("physical-size gate rejects 1 cm speck", tiny is None)
+# Range: a nut 3.0 m ahead is beyond max_range (2.5 m).
+P3 = np.array([origin[0] + 3.0 * math.cos(az), origin[1] + 3.0 * math.sin(az), 0.0])
+u3, v3, _ = project_into_image(P3, origin, R_mo)
+g3 = det._project_pixels_to_ground(np.array([[u3, v3]]), origin, R_mo)
+rng3 = math.hypot(g3[0, 0] - origin[0], g3[0, 1] - origin[1])
+check("nut at 3.0 m is outside the range gate",
+      not (det.min_range <= rng3 <= det.max_range), f"rng={rng3:.2f} m")
 
-# Range gate: a nut 3.0 m ahead (> max_range 2.5).
-Pfar = np.array([origin[0] + 3.0 * math.cos(az), origin[1] + 3.0 * math.sin(az), 0.0])
-uf, vf, Zf = project_into_image(Pfar, origin, R_mo)
-far = det.project_and_gate(uf, vf, FX * 0.015 / float(np.linalg.norm(Pfar - origin)),
-                           origin, R_mo)
-check("range gate rejects nut at 3.0 m", far is None)
-
-# A ray that points UP (above horizon) must be rejected.
-up = det.project_and_gate(CX, 10.0, 10.0, origin, R_mo)   # v<<cy -> upward ray
-check("upward ray (sky/wall) rejected", up is None)
+# Upward ray (above the horizon) must not project to the floor.
+up = det._project_pixels_to_ground(np.array([[CX, 10.0]]), origin, R_mo)   # v << cy
+check("upward ray (wall/sky) does not project to the floor", up is None)
 
 # ===========================================================================
 print("=== nut_detector: depth on-floor gate ===")
-# Build a depth image (metres) that says 'floor' at the nut pixel.
-ui, vi = int(round(u)), int(round(v))
+ui, vi = int(round(float(np.mean(pix[:, 0])))), int(round(float(np.mean(pix[:, 1]))))
+s_pred = det._forward_depth(ui, vi, origin, R_mo)
+check("forward depth is positive (floor ahead)", s_pred is not None and s_pred > 0,
+      f"s={s_pred}")
+
 depth_floor = np.full((432, 768), np.nan, dtype=np.float32)
-depth_floor[vi - 4:vi + 5, ui - 4:ui + 5] = Z          # matches predicted floor
+depth_floor[vi - 4:vi + 5, ui - 4:ui + 5] = s_pred           # surface == floor
 det_df = make_detector(use_depth=True, depth_img=depth_floor)
-on_floor = det_df.project_and_gate(u, v, radius_px, origin, R_mo)
-check("depth gate ACCEPTS a nut lying on the floor", on_floor is not None)
+check("depth gate ACCEPTS a nut lying on the floor",
+      det_df._depth_on_floor(ui, vi, s_pred, 6))
 
-# Now say the surface is 0.5 m closer than the floor -> standing object.
 depth_stand = np.full((432, 768), np.nan, dtype=np.float32)
-depth_stand[vi - 4:vi + 5, ui - 4:ui + 5] = Z - 0.5
+depth_stand[vi - 4:vi + 5, ui - 4:ui + 5] = s_pred - 0.5     # surface 0.5 m closer
 det_ds = make_detector(use_depth=True, depth_img=depth_stand)
-standing = det_ds.project_and_gate(u, v, radius_px, origin, R_mo)
-check("depth gate REJECTS a surface standing up (chair)", standing is None)
+check("depth gate REJECTS a surface standing up (chair)",
+      not det_ds._depth_on_floor(ui, vi, s_pred, 6))
 
-# Missing depth (textureless card) -> accept (safe asymmetry).
 det_nan = make_detector(use_depth=True, depth_img=np.full((432, 768), np.nan, np.float32))
-missing = det_nan.project_and_gate(u, v, radius_px, origin, R_mo)
-check("depth gate ACCEPTS when depth is unavailable", missing is not None)
+check("depth gate ACCEPTS when depth is unavailable",
+      det_nan._depth_on_floor(ui, vi, s_pred, 6))
 
 # ===========================================================================
 print("=== nut_detector: decoders ===")
