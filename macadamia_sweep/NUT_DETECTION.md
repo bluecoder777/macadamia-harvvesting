@@ -45,6 +45,13 @@ sudo apt install python3-opencv python3-numpy
 
 In both modes the colour-independent **shape gate** (size + circularity) does the real discrimination, so it rejects noodle bases, walls and turf speckle regardless of nut colour.
 
+### Rejecting clutter (chairs, bags, cupboards)
+Five colour-independent gates stack, in order: horizon cut → pixel area → circularity → on-floor projection + range → **physical size (m)** → **depth on-floor**. The last two are the heavy lifters for furniture:
+- **Physical-size**: after projection the range is known, so the blob's real diameter must be ~1.5–8 cm. A round chair wheel rarely is.
+- **Depth on-floor**: the aligned depth must agree the blob *lies on the floor*. A surface standing up (measured closer than the floor plane) is rejected — this targets furniture specifically, regardless of its colour. Textureless nuts that return no depth are accepted (the gate only rejects on positive evidence of standing-up geometry).
+
+Watch it work on `/nuts/debug_image`: rejected blobs draw **orange**, accepted **green** — drive past your chairs and they should stay orange. Residual risk: a small, round, ~3 cm object *lying on the floor* (bottle cap, coin) can still pass — only a spatial sweep-area gate or a learned classifier removes those.
+
 ## Calibrate (do this once)
 
 ```bash
@@ -90,6 +97,8 @@ PY
 - `floor_h_lo/floor_h_hi`, `floor_s_min`, `floor_v_min/floor_v_max` — floor (astroturf) colour to subtract in **background** mode.
 - `h_lo1/h_hi1`, `h_lo2/h_hi2`, `s_min/s_max`, `v_min/v_max` — HSV nut gate in **color** mode (two hue bands for red wrap).
 - `min_area_px` / `max_area_px`, `min_circularity` — shape gate (colour-independent; the real nut/not-nut discriminator).
+- `min_nut_diameter_m` / `max_nut_diameter_m` (0.015 / 0.08) — range-aware **physical-size** gate: real diameter must be nut-sized.
+- `use_depth_gate` (true), `depth_topic`, `depth_floor_tolerance` (0.10 m) — **depth on-floor** gate: rejects surfaces standing up off the floor (chairs/bags/cupboards). Set `use_depth_gate:=false` to A/B it.
 - `roi_top_fraction` (0.45) — ignore image above the horizon.
 - `min_range` / `max_range` (0.30 / 2.50 m) — reject too-near/too-far projections.
 - `process_every_n` (2) — throttle vs the ~14 Hz camera.

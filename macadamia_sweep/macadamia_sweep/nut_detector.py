@@ -85,6 +85,27 @@ def image_to_bgr(msg: Image) -> Optional[np.ndarray]:
     return None
 
 
+def depth_to_metres(msg: Image) -> Optional[np.ndarray]:
+    """Decode an aligned depth image to a float32 array in METRES, with invalid
+    pixels set to NaN. Handles the two OAK-D depth encodings (16UC1 mm, 32FC1 m).
+    """
+    h, w = msg.height, msg.width
+    enc = msg.encoding.lower()
+    if enc in ("16uc1", "mono16"):
+        arr = np.frombuffer(msg.data, dtype=np.uint16).reshape(h, msg.step // 2)[:, :w]
+        out = arr.astype(np.float32) / 1000.0
+        out[arr == 0] = np.nan
+    elif enc == "32fc1":
+        arr = np.frombuffer(msg.data, dtype=np.float32).reshape(h, msg.step // 4)[:, :w]
+        out = np.array(arr, dtype=np.float32, copy=True)
+        out[~np.isfinite(out)] = np.nan
+        out[out <= 0.0] = np.nan
+    else:
+        return None
+    out[out > 10.0] = np.nan  # nothing useful past 10 m indoors
+    return out
+
+
 def quat_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
     """3x3 rotation matrix from a (x, y, z, w) quaternion."""
     return np.array(
@@ -147,8 +168,25 @@ class NutDetector(Node):
 
         # ---- Shape / size gate ----
         self.declare_parameter("min_area_px", 30.0)
-        self.declare_parameter("max_area_px", 4000.0)
-        self.declare_parameter("min_circularity", 0.6)   # 4*pi*A / P^2 (1.0 = perfect circle)
+        self.declare_parameter("max_area_px", 1500.0)
+        self.declare_parameter("min_circularity", 0.70)   # 4*pi*A / P^2 (1.0 = perfect circle)
+        # Range-AWARE physical-size gate (the strongest clutter rejector).
+        # After the floor projection we know the range, so we check the blob's
+        # REAL diameter (m), not just pixels. A nut is ~3 cm; a round piece of
+        # furniture on the floor is rarely also 1.5-8 cm across.
+        self.declare_parameter("min_nut_diameter_m", 0.015)
+        self.declare_parameter("max_nut_diameter_m", 0.08)
+
+        # ---- Depth on-floor gate (rejects things standing UP off the floor:
+        # chairs, bags, cupboards) ----
+        # Uses the aligned depth image. A nut lies flat, so the measured depth
+        # at its pixel matches the floor-plane-predicted distance. Furniture
+        # surfaces sit CLOSER than the floor at that pixel -> rejected.
+        self.declare_parameter("use_depth_gate", True)
+        self.declare_parameter("depth_topic", "/oak/stereo/image_raw")
+        # Reject if the measured surface is closer than the predicted floor by
+        # more than this (m). Generous, to absorb stereo noise.
+        self.declare_parameter("depth_floor_tolerance", 0.10)
         # Ignore everything ABOVE this fraction of image height (the horizon
         # and walls/noodles above it). Camera is horizontal so the horizon is
         # at v=cy~206 of 432 ~ 0.48; 0.45 trims just above it.
@@ -166,6 +204,11 @@ class NutDetector(Node):
         self.min_area = float(self.get_parameter("min_area_px").value)
         self.max_area = float(self.get_parameter("max_area_px").value)
         self.min_circularity = float(self.get_parameter("min_circularity").value)
+        self.min_nut_d = float(self.get_parameter("min_nut_diameter_m").value)
+        self.max_nut_d = float(self.get_parameter("max_nut_diameter_m").value)
+        self.use_depth_gate = bool(self.get_parameter("use_depth_gate").value)
+        self.depth_topic = self.get_parameter("depth_topic").value
+        self.depth_floor_tol = float(self.get_parameter("depth_floor_tolerance").value)
         self.roi_top_fraction = float(self.get_parameter("roi_top_fraction").value)
         self.min_range = float(self.get_parameter("min_range").value)
         self.max_range = float(self.get_parameter("max_range").value)
@@ -197,6 +240,13 @@ class NutDetector(Node):
         )
         self.create_subscription(Image, self.rgb_topic, self.image_callback, 10)
 
+        # Latest aligned depth (metres, NaN where invalid). None until first msg.
+        self._depth_m: Optional[np.ndarray] = None
+        if self.use_depth_gate:
+            self.create_subscription(
+                Image, self.depth_topic, self.depth_callback, 10
+            )
+
         self.frame_count = 0
         self._debug_tint: Optional[np.ndarray] = None
         self._debug_tint_label = ""
@@ -214,9 +264,13 @@ class NutDetector(Node):
                 f"[{self.get_parameter('h_lo2').value}-"
                 f"{self.get_parameter('h_hi2').value}])"
             )
+        depth_str = (
+            f"depth-gate ON ({self.depth_topic}, tol {self.depth_floor_tol:.2f}m)"
+            if self.use_depth_gate else "depth-gate OFF"
+        )
         self.get_logger().info(
             f"nut_detector up. rgb={self.rgb_topic} -> {self.target_frame}. "
-            f"{mode_str}. Tune against /nuts/debug_image."
+            f"{mode_str}. {depth_str}. Tune against /nuts/debug_image."
         )
 
     # -----------------------------
@@ -236,6 +290,17 @@ class NutDetector(Node):
                 f"cx={self.cx:.1f} cy={self.cy:.1f} ({msg.width}x{msg.height})"
             )
 
+    def depth_callback(self, msg: Image):
+        depth = depth_to_metres(msg)
+        if depth is None:
+            self.get_logger().warn(
+                f"Unhandled depth encoding '{msg.encoding}'; disabling depth gate.",
+                throttle_duration_sec=10.0,
+            )
+            self.use_depth_gate = False
+            return
+        self._depth_m = depth
+
     def image_callback(self, msg: Image):
         self.frame_count += 1
         if self.frame_count % self.process_every_n != 0:
@@ -251,24 +316,32 @@ class NutDetector(Node):
         mask = self.colour_mask(bgr)
         detections_px = self.find_nut_pixels(mask)
 
-        # Project each pixel detection onto the floor in target_frame.
+        # Project each pixel detection onto the floor in target_frame. The
+        # camera->map transform is the same for every blob in this frame, so
+        # look it up ONCE here rather than per blob.
         source_frame = msg.header.frame_id or "oak_rgb_camera_optical_frame"
+        cam = self._lookup_camera_pose(source_frame, msg.header.stamp)
         poses: List[Pose] = []
         accepted_px: List[Tuple[int, int, int]] = []  # (u, v, radius) for debug
-        tf_ok = True
-        for (u, v, radius) in detections_px:
-            pt = self.pixel_to_ground(u, v, source_frame, msg.header.stamp)
-            if pt is None:
-                tf_ok = False
-                continue
-            mx, my, mz = pt
-            p = Pose()
-            p.position.x = mx
-            p.position.y = my
-            p.position.z = mz
-            p.orientation.w = 1.0
-            poses.append(p)
-            accepted_px.append((u, v, radius))
+
+        if cam is None:
+            if detections_px:
+                self.get_logger().warn(
+                    f"Saw {len(detections_px)} nut blob(s) but TF "
+                    f"{self.target_frame}<-{source_frame} was unavailable.",
+                    throttle_duration_sec=5.0,
+                )
+        else:
+            origin, R = cam
+            for (u, v, radius) in detections_px:
+                pt = self.project_and_gate(u, v, radius, origin, R)
+                if pt is None:
+                    continue
+                p = Pose()
+                p.position.x, p.position.y, p.position.z = pt
+                p.orientation.w = 1.0
+                poses.append(p)
+                accepted_px.append((u, v, radius))
 
         out = PoseArray()
         out.header.stamp = msg.header.stamp
@@ -278,13 +351,6 @@ class NutDetector(Node):
 
         if self.debug_pub is not None:
             self.publish_debug_image(bgr, mask, detections_px, accepted_px, msg.header.stamp)
-
-        if detections_px and not tf_ok:
-            self.get_logger().warn(
-                f"Saw {len(detections_px)} nut blob(s) but TF "
-                f"{self.target_frame}<-{source_frame} was unavailable for some.",
-                throttle_duration_sec=5.0,
-            )
 
     # -----------------------------
     # Vision
@@ -363,16 +429,8 @@ class NutDetector(Node):
     # Geometry: pixel -> floor point in target_frame
     # -----------------------------
 
-    def pixel_to_ground(
-        self, u: int, v: int, source_frame: str, stamp
-    ) -> Optional[Tuple[float, float, float]]:
-        """Intersect the camera ray through pixel (u,v) with the floor plane
-        z = ground_z, expressed in target_frame. Returns (x, y, z) or None."""
-        # Ray direction in the optical frame (z forward, x right, y down).
-        d_opt = np.array(
-            [(u - self.cx) / self.fx, (v - self.cy) / self.fy, 1.0], dtype=float
-        )
-
+    def _lookup_camera_pose(self, source_frame: str, stamp):
+        """Return (origin[3], R[3x3]) of the camera in target_frame, or None."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.target_frame, source_frame, Time.from_msg(stamp),
@@ -386,15 +444,27 @@ class NutDetector(Node):
                 )
             except Exception:
                 return None
-
         t = tf.transform.translation
         q = tf.transform.rotation
         R = quat_to_rotation_matrix(q.x, q.y, q.z, q.w)
         origin = np.array([t.x, t.y, t.z], dtype=float)
-        d_map = R @ d_opt  # ray direction in target_frame
+        return origin, R
 
-        # Need the ray to head DOWN toward the floor.
-        if d_map[2] >= -1e-6:
+    def project_and_gate(
+        self, u: int, v: int, radius_px: float, origin: np.ndarray, R: np.ndarray
+    ) -> Optional[Tuple[float, float, float]]:
+        """Intersect the camera ray through pixel (u,v) with the floor plane
+        z = ground_z, then apply the range, physical-size and depth-on-floor
+        gates. origin/R are the camera pose in target_frame. Returns (x,y,z)."""
+        # Ray direction in the optical frame (z forward, x right, y down). Its
+        # z-component is 1, so the scalar `s` below is also the forward optical
+        # depth to the floor point -- which is exactly what a depth image
+        # measures (used by the depth gate).
+        d_opt = np.array(
+            [(u - self.cx) / self.fx, (v - self.cy) / self.fy, 1.0], dtype=float
+        )
+        d_map = R @ d_opt
+        if d_map[2] >= -1e-6:          # ray must head DOWN toward the floor
             return None
         s = (self.ground_z - origin[2]) / d_map[2]
         if s <= 0:
@@ -402,12 +472,44 @@ class NutDetector(Node):
         point = origin + s * d_map
 
         # Range gate (horizontal distance camera->nut).
-        dx = point[0] - origin[0]
-        dy = point[1] - origin[1]
-        rng = math.hypot(dx, dy)
+        rng = math.hypot(point[0] - origin[0], point[1] - origin[1])
         if rng < self.min_range or rng > self.max_range:
             return None
+
+        # Range-aware physical-size gate: real diameter = 2*radius_px * R / fx,
+        # using slant range as the pixel->metre scale.
+        slant = math.hypot(rng, origin[2] - self.ground_z)
+        diameter_m = 2.0 * radius_px * slant / self.fx
+        if diameter_m < self.min_nut_d or diameter_m > self.max_nut_d:
+            return None
+
+        # Depth on-floor gate: reject surfaces standing up in front of the floor.
+        if self.use_depth_gate and not self._depth_on_floor(u, v, s, radius_px):
+            return None
+
         return (float(point[0]), float(point[1]), float(point[2]))
+
+    def _depth_on_floor(self, u: int, v: int, s_pred: float, radius_px: float) -> bool:
+        """True if the measured depth at the blob is consistent with it lying
+        on the floor (or depth is unavailable -> can't judge, so accept).
+
+        s_pred is the forward distance to the floor at this pixel. A surface
+        measured clearly CLOSER than that is standing up off the floor."""
+        depth = self._depth_m
+        if depth is None:
+            return True
+        u, v = int(round(u)), int(round(v))   # robust to float centroids
+        h, w = depth.shape
+        if not (0 <= u < w and 0 <= v < h):
+            return True
+        r = max(2, int(radius_px // 2))
+        patch = depth[max(0, v - r):min(h, v + r + 1),
+                      max(0, u - r):min(w, u + r + 1)]
+        valid = patch[np.isfinite(patch)]
+        if valid.size < 3:
+            return True   # textureless (e.g. the card itself) -> can't judge
+        measured = float(np.median(valid))
+        return (s_pred - measured) <= self.depth_floor_tol
 
     # -----------------------------
     # Debug overlay
