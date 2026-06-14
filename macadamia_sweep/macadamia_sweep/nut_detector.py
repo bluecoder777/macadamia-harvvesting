@@ -207,7 +207,12 @@ class NutDetector(Node):
         # Uses the aligned depth image. A nut lies flat, so the measured depth
         # at its pixel matches the floor-plane-predicted distance. Furniture
         # surfaces sit CLOSER than the floor at that pixel -> rejected.
-        self.declare_parameter("use_depth_gate", True)
+        # OFF by default: a real-run diagnostic showed the depth gate rejecting
+        # ~486 textbook 3 cm nuts (median 2.99 cm) at 0.9-1.5 m -- the OAK-D
+        # stereo reads the floor slightly closer than the geometry predicts and
+        # the gate mistakes that for "standing up". Noodles are already rejected
+        # by solidity + size, so the gate cost recall without adding protection.
+        self.declare_parameter("use_depth_gate", False)
         self.declare_parameter("depth_topic", "/oak/stereo/image_raw")
         # Reject if the measured surface is closer than the predicted floor by
         # more than this (m). Generous, to absorb stereo noise.
@@ -298,7 +303,8 @@ class NutDetector(Node):
             self._diag_file = open(diag_path, "w", newline="")
             self._diag_writer = csv.writer(self._diag_file)
             self._diag_writer.writerow(
-                ["t_s", "cam_x", "cam_y", "status", "area_px", "range_m", "diam_cm", "circ"])
+                ["t_s", "cam_x", "cam_y", "nut_x", "nut_y", "status",
+                 "area_px", "range_m", "diam_cm", "circ"])
             self._diag_file.flush()
             self.get_logger().info(f"Writing per-blob diagnostics to {diag_path}")
 
@@ -385,9 +391,10 @@ class NutDetector(Node):
             t = (self.get_clock().now() - self._diag_start).nanoseconds * 1e-9
             cam_x = cam[0][0] if cam is not None else float("nan")
             cam_y = cam[0][1] if cam is not None else float("nan")
-            for (status, area_px, rng, diam_cm, circ) in diags:
+            for (status, area_px, rng, diam_cm, circ, nx, ny) in diags:
                 self._diag_writer.writerow([
-                    f"{t:.2f}", _fmt_num(cam_x), _fmt_num(cam_y), status,
+                    f"{t:.2f}", _fmt_num(cam_x), _fmt_num(cam_y),
+                    _fmt_num(nx), _fmt_num(ny), status,
                     f"{area_px:.0f}", _fmt_num(rng), _fmt_num(diam_cm), _fmt_num(circ),
                 ])
             self._diag_file.flush()
@@ -494,7 +501,7 @@ class NutDetector(Node):
             (pu, pv), prad = cv2.minEnclosingCircle(c)
             u, v, radius = int(round(pu)), int(round(pv)), int(round(prad))
             area_px = float(cv2.contourArea(c))
-            rng = diam = circ = NAN
+            rng = diam = circ = nx = ny = NAN
             status = "ok"
 
             # Single-exit classification (so every blob also gets a diag row).
@@ -520,6 +527,8 @@ class NutDetector(Node):
                             rng = math.hypot(cx - origin[0], cy - origin[1])
                             diam = 2.0 * math.sqrt(m_area / math.pi)
                             circ = 4.0 * math.pi * m_area / (m_perim * m_perim)
+                            nx, ny = cx, cy
+
                             if rng < self.min_range or rng > self.max_range:
                                 status = "range"
                             elif diam < self.min_nut_d or diam > self.max_nut_d:
@@ -539,7 +548,7 @@ class NutDetector(Node):
 
             draw.append((u, v, radius, status))
             diags.append((status, area_px, rng,
-                          (diam * 100.0 if not math.isnan(diam) else NAN), circ))
+                          (diam * 100.0 if not math.isnan(diam) else NAN), circ, nx, ny))
 
         return points, draw, diags
 

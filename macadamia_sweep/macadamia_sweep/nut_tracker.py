@@ -71,8 +71,11 @@ class NutTracker(Node):
         self.declare_parameter("robot_frame", "base_link")
 
         # ---- Association / confirmation ----
-        # Two detections within this distance are the SAME nut.
-        self.declare_parameter("merge_radius", 0.15)
+        # Two detections within this distance are the SAME nut. Set wide enough
+        # to absorb the projected-position jitter of far/foreshortened nuts
+        # (which otherwise spawn a cloud of phantom nuts), but below the real
+        # nut spacing so distinct nuts stay distinct.
+        self.declare_parameter("merge_radius", 0.25)
         # Hits before a candidate becomes a confirmed (shown) nut.
         self.declare_parameter("min_hits", 3)
 
