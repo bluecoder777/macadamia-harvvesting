@@ -586,29 +586,31 @@ class NutDetector(Node):
 
     def publish_debug_image(self, bgr, draw, stamp):
         vis = bgr.copy()
-        # Tint the selected/removed pixels so tuning is obvious: in background
-        # mode this is the FLOOR being subtracted (tune until all floor is
-        # tinted); in colour mode it's the selected nut hue. Magenta is chosen
-        # so it stays visible over a green OR blue floor.
+        # DARKEN the removed/selected pixels rather than colour-tinting them, so
+        # this never clashes with the marker colour. In background mode the
+        # removed FLOOR goes dark grey and the kept markers keep their full
+        # colour -- and if the floor range is wrongly eating a marker, it shows
+        # as a dark BITE out of that marker (a direct check of your question).
         tint = self._debug_tint
         if tint is not None:
-            vis[tint > 0] = (0.5 * vis[tint > 0] + np.array([160, 0, 160])).astype(np.uint8)
+            vis[tint > 0] = (0.30 * vis[tint > 0]).astype(np.uint8)
         # Horizon / ROI line.
         roi_top = int(self.roi_top_fraction * bgr.shape[0])
         cv2.line(vis, (0, roi_top), (vis.shape[1], roi_top), (255, 255, 0), 1)
-        # Status colours: green = accepted nut, orange = passed shape but a
-        # gate rejected it, yellow = found in mask but wrong shape/size.
-        colours = {"ok": (0, 255, 0), "gate": (0, 165, 255), "shape": (0, 255, 255)}
+        # Status colours, chosen to stay distinct from an orange marker:
+        # green = accepted, RED = passed pre-filters but a metric/depth gate
+        # rejected it, yellow = failed the cheap pre-filters or metric roundness.
+        colours = {"ok": (0, 255, 0), "gate": (0, 0, 255), "shape": (0, 255, 255)}
         n = {"ok": 0, "gate": 0, "shape": 0}
         for (u, v, radius, st) in draw:
             n[st] = n.get(st, 0) + 1
-            colour = colours.get(st, (0, 0, 255))
+            colour = colours.get(st, (255, 0, 255))
             cv2.circle(vis, (u, v), max(radius, 3), colour, 2)
             cv2.circle(vis, (u, v), 2, colour, -1)
         cv2.putText(
             vis,
             f"{self._debug_tint_label} | "
-            f"green(ok):{n['ok']} orange(gate):{n['gate']} yellow(shape):{n['shape']}",
+            f"green(ok):{n['ok']} red(gate):{n['gate']} yellow(shape):{n['shape']}",
             (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
         )
 
