@@ -452,41 +452,43 @@ class NutDetector(Node):
             # --- cheap pixel pre-filters (reject noise before projecting) ---
             area_px = cv2.contourArea(c)
             if area_px < self.min_area:
-                draw.append((u, v, radius, "shape")); continue
+                draw.append((u, v, radius, "small")); continue
             hull_area = cv2.contourArea(cv2.convexHull(c))
             solidity = area_px / hull_area if hull_area > 0 else 0.0
             if solidity < self.min_solidity:
-                draw.append((u, v, radius, "shape")); continue
+                draw.append((u, v, radius, "ragged")); continue
 
             if origin is None:                 # no TF -> can't judge metrically
-                draw.append((u, v, radius, "gate")); continue
+                draw.append((u, v, radius, "notf")); continue
 
-            # --- project the contour onto the floor; judge in METRES ---
+            # --- project the contour onto the floor; judge in METRES.
+            # The draw status names the exact gate that rejects, so the debug
+            # label shows WHY (e.g. size:5 circ:3 depth:2). ---
             poly = self._project_pixels_to_ground(
                 c.reshape(-1, 2).astype(float), origin, R)
             if poly is None:                   # straddles horizon -> not on floor
-                draw.append((u, v, radius, "gate")); continue
+                draw.append((u, v, radius, "horizon")); continue
             m_area, m_perim, cx, cy = self._polygon_metrics(poly)
             if m_area <= 0.0 or m_perim <= 0.0:
-                draw.append((u, v, radius, "gate")); continue
+                draw.append((u, v, radius, "horizon")); continue
 
             rng = math.hypot(cx - origin[0], cy - origin[1])
             if rng < self.min_range or rng > self.max_range:
-                draw.append((u, v, radius, "gate")); continue
+                draw.append((u, v, radius, "range")); continue
 
             eq_diam = 2.0 * math.sqrt(m_area / math.pi)   # equivalent disc diameter
             if eq_diam < self.min_nut_d or eq_diam > self.max_nut_d:
-                draw.append((u, v, radius, "gate")); continue
+                draw.append((u, v, radius, "size")); continue
 
             circularity = 4.0 * math.pi * m_area / (m_perim * m_perim)
             if circularity < self.min_metric_circularity:
-                draw.append((u, v, radius, "shape")); continue
+                draw.append((u, v, radius, "circ")); continue
 
             # --- depth on-floor gate (reject objects standing up off the floor) ---
             if self.use_depth_gate:
                 s_pred = self._forward_depth(u, v, origin, R)
                 if s_pred is not None and not self._depth_on_floor(u, v, s_pred, radius):
-                    draw.append((u, v, radius, "gate")); continue
+                    draw.append((u, v, radius, "depth")); continue
 
             points.append((cx, cy))
             draw.append((u, v, radius, "ok"))
@@ -599,20 +601,26 @@ class NutDetector(Node):
         # Horizon / ROI line.
         roi_top = int(self.roi_top_fraction * bgr.shape[0])
         cv2.line(vis, (0, roi_top), (vis.shape[1], roi_top), (255, 255, 0), 1)
-        # Status colours, chosen to stay distinct from an orange marker:
-        # green = accepted, RED = passed pre-filters but a metric/depth gate
-        # rejected it, yellow = failed the cheap pre-filters or metric roundness.
-        colours = {"ok": (0, 255, 0), "gate": (0, 0, 255), "shape": (0, 255, 255)}
-        n = {"ok": 0, "gate": 0, "shape": 0}
+        # green = accepted; yellow = failed the cheap pixel pre-filters; red =
+        # rejected by a specific METRIC gate. The label NAMES each reason so you
+        # can see WHY a nut is red (range / size / circ / depth / horizon).
+        GREEN = {"ok"}
+        YELLOW = {"small", "ragged"}
+        order = ["ok", "small", "ragged", "notf", "horizon", "range", "size", "circ", "depth"]
+        n = {}
         for (u, v, radius, st) in draw:
             n[st] = n.get(st, 0) + 1
-            colour = colours.get(st, (255, 0, 255))
+            if st in GREEN:
+                colour = (0, 255, 0)
+            elif st in YELLOW:
+                colour = (0, 255, 255)
+            else:
+                colour = (0, 0, 255)
             cv2.circle(vis, (u, v), max(radius, 3), colour, 2)
             cv2.circle(vis, (u, v), 2, colour, -1)
+        parts = " ".join(f"{k}:{n[k]}" for k in order if n.get(k))
         cv2.putText(
-            vis,
-            f"{self._debug_tint_label} | "
-            f"green(ok):{n['ok']} red(gate):{n['gate']} yellow(shape):{n['shape']}",
+            vis, f"{self._debug_tint_label} | {parts or 'no blobs'}",
             (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
         )
 
