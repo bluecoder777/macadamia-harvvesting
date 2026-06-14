@@ -43,6 +43,7 @@ Run:
     ros2 run rqt_image_view rqt_image_view /nuts/debug_image
 """
 
+import csv
 import math
 from typing import List, Optional, Tuple
 
@@ -58,6 +59,13 @@ from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseArray, Pose
 
 import tf2_ros
+
+
+def _fmt_num(x) -> str:
+    """Format a float for the diagnostic CSV; blank for None/NaN."""
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return ""
+    return f"{x:.3f}"
 
 
 def image_to_bgr(msg: Image) -> Optional[np.ndarray]:
@@ -181,6 +189,11 @@ class NutDetector(Node):
         # (circularity ~1) regardless of camera angle -- the angle-invariant
         # roundness test that replaces judging shape in the distorted image.
         self.declare_parameter("min_metric_circularity", 0.65)
+        # Circularity is only meaningful for blobs with enough pixels. Below
+        # this PIXEL area the projected polygon is too coarse to assess
+        # roundness, so the circ gate is SKIPPED and a far/small nut is judged
+        # on metric diameter + depth alone -- this is what recovers distant nuts.
+        self.declare_parameter("circ_min_area_px", 60.0)
         # Range-AWARE physical-size gate (the strongest clutter rejector).
         # After the floor projection we know the range, so we check the blob's
         # REAL diameter (m), not just pixels. A nut is ~3 cm; the cap is 5 cm so
@@ -223,6 +236,7 @@ class NutDetector(Node):
         self.min_metric_circularity = float(
             self.get_parameter("min_metric_circularity").value
         )
+        self.circ_min_area_px = float(self.get_parameter("circ_min_area_px").value)
         self.min_nut_d = float(self.get_parameter("min_nut_diameter_m").value)
         self.max_nut_d = float(self.get_parameter("max_nut_diameter_m").value)
         self.use_depth_gate = bool(self.get_parameter("use_depth_gate").value)
@@ -270,6 +284,23 @@ class NutDetector(Node):
         self.frame_count = 0
         self._debug_tint: Optional[np.ndarray] = None
         self._debug_tint_label = ""
+
+        # Optional per-blob diagnostic CSV: one row per candidate blob over a
+        # whole run, with its range/size/roundness and which gate it hit. Set
+        #   -p diag_csv:=~/nut_diag.csv
+        # then `cat` the file after the run. Lets us tune thresholds vs distance.
+        self.declare_parameter("diag_csv", "")
+        self._diag_file = None
+        self._diag_writer = None
+        self._diag_start = self.get_clock().now()
+        diag_path = str(self.get_parameter("diag_csv").value)
+        if diag_path:
+            self._diag_file = open(diag_path, "w", newline="")
+            self._diag_writer = csv.writer(self._diag_file)
+            self._diag_writer.writerow(
+                ["t_s", "cam_x", "cam_y", "status", "area_px", "range_m", "diam_cm", "circ"])
+            self._diag_file.flush()
+            self.get_logger().info(f"Writing per-blob diagnostics to {diag_path}")
 
         if self.detect_mode == "background":
             mode_str = (
@@ -340,7 +371,7 @@ class NutDetector(Node):
         source_frame = msg.header.frame_id or "oak_rgb_camera_optical_frame"
         cam = self._lookup_camera_pose(source_frame, msg.header.stamp)
 
-        points, draw = self.detect_nuts(mask, cam)
+        points, draw, diags = self.detect_nuts(mask, cam)
 
         if cam is None and draw:
             self.get_logger().warn(
@@ -348,6 +379,18 @@ class NutDetector(Node):
                 f"{self.target_frame}<-{source_frame} was unavailable.",
                 throttle_duration_sec=5.0,
             )
+
+        # Per-blob diagnostic CSV (one row per candidate this frame).
+        if self._diag_writer is not None and diags:
+            t = (self.get_clock().now() - self._diag_start).nanoseconds * 1e-9
+            cam_x = cam[0][0] if cam is not None else float("nan")
+            cam_y = cam[0][1] if cam is not None else float("nan")
+            for (status, area_px, rng, diam_cm, circ) in diags:
+                self._diag_writer.writerow([
+                    f"{t:.2f}", _fmt_num(cam_x), _fmt_num(cam_y), status,
+                    f"{area_px:.0f}", _fmt_num(rng), _fmt_num(diam_cm), _fmt_num(circ),
+                ])
+            self._diag_file.flush()
 
         poses: List[Pose] = []
         for (x, y) in points:
@@ -441,59 +484,64 @@ class NutDetector(Node):
         )
         points: List[Tuple[float, float]] = []
         draw: List[Tuple[int, int, int, str]] = []
+        diags: List[tuple] = []   # (status, area_px, range_m, diam_cm, circ) per blob
         origin = R = None
         if cam is not None:
             origin, R = cam
+        NAN = float("nan")
 
         for c in contours:
             (pu, pv), prad = cv2.minEnclosingCircle(c)
             u, v, radius = int(round(pu)), int(round(pv)), int(round(prad))
+            area_px = float(cv2.contourArea(c))
+            rng = diam = circ = NAN
+            status = "ok"
 
-            # --- cheap pixel pre-filters (reject noise before projecting) ---
-            area_px = cv2.contourArea(c)
+            # Single-exit classification (so every blob also gets a diag row).
             if area_px < self.min_area:
-                draw.append((u, v, radius, "small")); continue
-            hull_area = cv2.contourArea(cv2.convexHull(c))
-            solidity = area_px / hull_area if hull_area > 0 else 0.0
-            if solidity < self.min_solidity:
-                draw.append((u, v, radius, "ragged")); continue
+                status = "small"
+            else:
+                hull_area = cv2.contourArea(cv2.convexHull(c))
+                solidity = area_px / hull_area if hull_area > 0 else 0.0
+                if solidity < self.min_solidity:
+                    status = "ragged"
+                elif origin is None:                 # no TF -> can't judge metrically
+                    status = "notf"
+                else:
+                    poly = self._project_pixels_to_ground(
+                        c.reshape(-1, 2).astype(float), origin, R)
+                    if poly is None:                  # straddles horizon -> not on floor
+                        status = "horizon"
+                    else:
+                        m_area, m_perim, cx, cy = self._polygon_metrics(poly)
+                        if m_area <= 0.0 or m_perim <= 0.0:
+                            status = "horizon"
+                        else:
+                            rng = math.hypot(cx - origin[0], cy - origin[1])
+                            diam = 2.0 * math.sqrt(m_area / math.pi)
+                            circ = 4.0 * math.pi * m_area / (m_perim * m_perim)
+                            if rng < self.min_range or rng > self.max_range:
+                                status = "range"
+                            elif diam < self.min_nut_d or diam > self.max_nut_d:
+                                status = "size"
+                            elif (area_px >= self.circ_min_area_px
+                                  and circ < self.min_metric_circularity):
+                                # roundness only judged when big enough to measure
+                                status = "circ"
+                            else:
+                                s_pred = self._forward_depth(u, v, origin, R)
+                                if (self.use_depth_gate and s_pred is not None
+                                        and not self._depth_on_floor(u, v, s_pred, radius)):
+                                    status = "depth"
+                                else:
+                                    status = "ok"
+                                    points.append((cx, cy))
 
-            if origin is None:                 # no TF -> can't judge metrically
-                draw.append((u, v, radius, "notf")); continue
+            draw.append((u, v, radius, status))
+            diags.append((status, area_px, rng,
+                          (diam * 100.0 if not math.isnan(diam) else NAN), circ))
 
-            # --- project the contour onto the floor; judge in METRES.
-            # The draw status names the exact gate that rejects, so the debug
-            # label shows WHY (e.g. size:5 circ:3 depth:2). ---
-            poly = self._project_pixels_to_ground(
-                c.reshape(-1, 2).astype(float), origin, R)
-            if poly is None:                   # straddles horizon -> not on floor
-                draw.append((u, v, radius, "horizon")); continue
-            m_area, m_perim, cx, cy = self._polygon_metrics(poly)
-            if m_area <= 0.0 or m_perim <= 0.0:
-                draw.append((u, v, radius, "horizon")); continue
-
-            rng = math.hypot(cx - origin[0], cy - origin[1])
-            if rng < self.min_range or rng > self.max_range:
-                draw.append((u, v, radius, "range")); continue
-
-            eq_diam = 2.0 * math.sqrt(m_area / math.pi)   # equivalent disc diameter
-            if eq_diam < self.min_nut_d or eq_diam > self.max_nut_d:
-                draw.append((u, v, radius, "size")); continue
-
-            circularity = 4.0 * math.pi * m_area / (m_perim * m_perim)
-            if circularity < self.min_metric_circularity:
-                draw.append((u, v, radius, "circ")); continue
-
-            # --- depth on-floor gate (reject objects standing up off the floor) ---
-            if self.use_depth_gate:
-                s_pred = self._forward_depth(u, v, origin, R)
-                if s_pred is not None and not self._depth_on_floor(u, v, s_pred, radius):
-                    draw.append((u, v, radius, "depth")); continue
-
-            points.append((cx, cy))
-            draw.append((u, v, radius, "ok"))
-
-        return points, draw
+        return points, draw, diags
 
     # -----------------------------
     # Geometry: pixel -> floor point in target_frame

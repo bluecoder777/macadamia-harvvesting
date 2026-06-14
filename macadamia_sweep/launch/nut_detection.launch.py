@@ -16,6 +16,7 @@ def generate_launch_description():
     rgb_topic = LaunchConfiguration("rgb_topic")
     target_frame = LaunchConfiguration("target_frame")
     detect_mode = LaunchConfiguration("detect_mode")
+    diag_csv = LaunchConfiguration("diag_csv")
 
     return LaunchDescription([
         DeclareLaunchArgument("rgb_topic", default_value="/oak/rgb/image_rect"),
@@ -24,6 +25,9 @@ def generate_launch_description():
             "detect_mode", default_value="color",
             description="color = match the orange nut hue (robust in clutter); "
                         "background = subtract the floor colour"),
+        DeclareLaunchArgument(
+            "diag_csv", default_value="",
+            description="path to write a per-blob diagnostic CSV (empty = off)"),
 
         Node(
             package="macadamia_sweep",
@@ -34,6 +38,7 @@ def generate_launch_description():
                 "rgb_topic": rgb_topic,
                 "target_frame": target_frame,
                 "detect_mode": detect_mode,
+                "diag_csv": diag_csv,
                 # Orange nut colour band (used when detect_mode == color).
                 "h_lo1": 5, "h_hi1": 28,
                 "h_lo2": 5, "h_hi2": 28,
