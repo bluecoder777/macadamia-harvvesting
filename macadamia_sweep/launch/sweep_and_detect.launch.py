@@ -30,6 +30,7 @@ def generate_launch_description():
     max_rows = LaunchConfiguration("max_rows")
     rgb_topic = LaunchConfiguration("rgb_topic")
     target_frame = LaunchConfiguration("target_frame")
+    detect_mode = LaunchConfiguration("detect_mode")
 
     return LaunchDescription([
         DeclareLaunchArgument("start_side", default_value="right",
@@ -38,6 +39,10 @@ def generate_launch_description():
                               description="0 = auto (continue while a next row is seen)"),
         DeclareLaunchArgument("rgb_topic", default_value="/oak/rgb/image_rect"),
         DeclareLaunchArgument("target_frame", default_value="map"),
+        DeclareLaunchArgument(
+            "detect_mode", default_value="color",
+            description="color = match the orange nut hue (robust in clutter); "
+                        "background = subtract the floor colour"),
 
         # --- Sweep controller (waits for /sweep_start) ---
         Node(
@@ -61,6 +66,11 @@ def generate_launch_description():
             parameters=[{
                 "rgb_topic": rgb_topic,
                 "target_frame": target_frame,
+                "detect_mode": detect_mode,
+                # Orange nut colour band (used when detect_mode == color).
+                "h_lo1": 5, "h_hi1": 28,
+                "h_lo2": 5, "h_hi2": 28,
+                "s_min": 90, "v_min": 60,
             }],
         ),
 

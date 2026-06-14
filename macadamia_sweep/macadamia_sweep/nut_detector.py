@@ -380,7 +380,9 @@ class NutDetector(Node):
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         roi_top = int(self.roi_top_fraction * bgr.shape[0])
 
-        if self.detect_mode == "background":
+        # Read live so detect_mode can be switched with `ros2 param set`.
+        mode = str(self.get_parameter("detect_mode").value).lower()
+        if mode == "background":
             # Subtract the floor (green astroturf); keep everything else.
             floor = cv2.inRange(
                 hsv,
