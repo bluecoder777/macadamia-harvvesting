@@ -320,6 +320,7 @@ def make_tracker():
     t.merge_radius = 0.15; t.min_hits = 3; t.collection_radius = 0.25
     t.map_frame = "map"; t.robot_frame = "base_link"
     t.marker_ns = "nuts"; t.marker_diameter = 0.08
+    t.use_tree_gate = False; t.tree_gate_radius = 0.50; t.tree_pts = []
     return t
 
 trk = make_tracker()
@@ -336,6 +337,19 @@ check("only the >=3-hit nut is confirmed", len(conf) == 1 and conf[0].id == 0,
 avg_ok = approx(trk.nuts[0].x, 1.02, 0.03) and approx(trk.nuts[0].y, 1.00, 0.03)
 check("merged position is the running average", avg_ok,
       f"({trk.nuts[0].x:.3f},{trk.nuts[0].y:.3f})")
+
+# ===========================================================================
+print("=== nut_tracker: tree (sweep-area) gate ===")
+tg = make_tracker()
+tg.use_tree_gate = True
+tg.tree_pts = [(1.00, 1.00)]                     # one known tree
+tg.associate(1.05, 1.02)                          # within 0.50 m of the tree -> kept
+check("nut near a tree is accepted", len(tg.nuts) == 1, f"n={len(tg.nuts)}")
+tg.associate(5.00, 5.00)                          # far from any tree -> rejected
+check("nut far from all trees is rejected", len(tg.nuts) == 1, f"n={len(tg.nuts)}")
+tg.tree_pts = []                                  # no trees known -> gate disabled
+tg.associate(9.00, 9.00)
+check("with no trees known, gate is skipped (accept)", len(tg.nuts) == 2)
 
 # ===========================================================================
 print("=== nut_tracker: drive-over collection ===")

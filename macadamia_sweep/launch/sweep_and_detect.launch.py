@@ -92,4 +92,16 @@ def generate_launch_description():
                 "map_frame": target_frame,
             }],
         ),
+
+        # --- Tree mapper: lidar trees -> /trees + zones; the tracker keeps
+        #     only nuts within tree_gate_radius of a tree ---
+        Node(
+            package="macadamia_sweep",
+            executable="tree_mapper",
+            name="tree_mapper",
+            output="screen",
+            parameters=[{
+                "target_frame": target_frame,
+            }],
+        ),
     ])

@@ -36,7 +36,7 @@ Run:
 import csv
 import math
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -79,6 +79,15 @@ class NutTracker(Node):
         # Hits before a candidate becomes a confirmed (shown) nut.
         self.declare_parameter("min_hits", 3)
 
+        # ---- Tree (sweep-area) gate ----
+        # A nut is kept only if it lies within tree_gate_radius of a known tree
+        # (from tree_mapper on /trees). Rejects off-row phantoms / clutter that
+        # the colour+shape gates can't. If no trees are known yet, gating is
+        # skipped (accept all) so it degrades gracefully without tree_mapper.
+        self.declare_parameter("use_tree_gate", True)
+        self.declare_parameter("tree_gate_radius", 0.50)
+        self.declare_parameter("trees_topic", "/trees")
+
         # ---- Collection ----
         # Robot "sweeps up" a nut when base_link passes within this radius.
         # ~ half the robot footprint / brush width. Tune to your sweeper.
@@ -97,6 +106,9 @@ class NutTracker(Node):
         self.robot_frame = self.get_parameter("robot_frame").value
         self.merge_radius = float(self.get_parameter("merge_radius").value)
         self.min_hits = int(self.get_parameter("min_hits").value)
+        self.use_tree_gate = bool(self.get_parameter("use_tree_gate").value)
+        self.tree_gate_radius = float(self.get_parameter("tree_gate_radius").value)
+        self.trees_topic = self.get_parameter("trees_topic").value
         self.collection_radius = float(self.get_parameter("collection_radius").value)
         self.marker_diameter = float(self.get_parameter("marker_diameter").value)
         self.marker_ns = self.get_parameter("marker_namespace").value
@@ -105,6 +117,7 @@ class NutTracker(Node):
         # ---- State ----
         self.nuts: List[Nut] = []
         self.next_id = 0
+        self.tree_pts: List[Tuple[float, float]] = []   # tree centres (sweep-area gate)
 
         # ---- TF (to read robot pose for the drive-over check) ----
         self.tf_buffer = tf2_ros.Buffer()
@@ -123,6 +136,13 @@ class NutTracker(Node):
 
         self.create_subscription(
             PoseArray, "/nuts/detections", self.detections_callback, 10
+        )
+        # Tree positions (latched) for the sweep-area gate.
+        tree_qos = QoSProfile(depth=1)
+        tree_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        tree_qos.history = HistoryPolicy.KEEP_LAST
+        self.create_subscription(
+            PoseArray, self.trees_topic, self.trees_callback, tree_qos
         )
 
         # Collection check + marker publish on a steady timer (independent of
@@ -151,9 +171,20 @@ class NutTracker(Node):
         for pose in msg.poses:
             self.associate(pose.position.x, pose.position.y)
 
+    def trees_callback(self, msg: PoseArray):
+        self.tree_pts = [(p.position.x, p.position.y) for p in msg.poses]
+
     def associate(self, x: float, y: float):
         """Nearest-neighbour: fold the detection into the closest existing nut
         within merge_radius, else start a new candidate."""
+        # Sweep-area gate: a real nut is near a tree. Reject detections that are
+        # not within tree_gate_radius of any known tree (off-row clutter). Skip
+        # the gate until at least one tree is known.
+        if self.use_tree_gate and self.tree_pts:
+            nearest = min(math.hypot(tx - x, ty - y) for (tx, ty) in self.tree_pts)
+            if nearest > self.tree_gate_radius:
+                return
+
         best: Optional[Nut] = None
         best_d = self.merge_radius
         for n in self.nuts:

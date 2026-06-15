@@ -53,6 +53,16 @@ Visualization Manager:
         History Policy: Keep Last
         Depth: 10
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Tree markers + zones
+      Enabled: true
+      Topic:
+        Value: /trees/markers
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Depth: 10
+      Value: true
     - Class: rviz_default_plugins/PoseArray
       Name: Uncollected nuts
       Enabled: true

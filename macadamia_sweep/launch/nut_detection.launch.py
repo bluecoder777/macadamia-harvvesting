@@ -57,4 +57,15 @@ def generate_launch_description():
                 "map_frame": target_frame,
             }],
         ),
+        # Detects the trees from the lidar -> /trees + zone markers, and the
+        # tracker keeps only nuts within tree_gate_radius of a tree.
+        Node(
+            package="macadamia_sweep",
+            executable="tree_mapper",
+            name="tree_mapper",
+            output="screen",
+            parameters=[{
+                "target_frame": target_frame,
+            }],
+        ),
     ])
