@@ -40,9 +40,12 @@ def generate_launch_description():
                 "detect_mode": detect_mode,
                 "diag_csv": diag_csv,
                 # Orange nut colour band (used when detect_mode == color).
-                "h_lo1": 5, "h_hi1": 28,
-                "h_lo2": 5, "h_hi2": 28,
-                "s_min": 90, "v_min": 60,
+                # Single band H 0-18 (orange doesn't wrap, so both bands are the
+                # same); low S/V to capture the WHOLE card, not just its
+                # saturated core -- avoids the small/ragged fragmentation.
+                "h_lo1": 0, "h_hi1": 18,
+                "h_lo2": 0, "h_hi2": 18,
+                "s_min": 50, "v_min": 40,
             }],
         ),
         Node(

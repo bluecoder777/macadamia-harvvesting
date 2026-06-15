@@ -75,7 +75,7 @@ class NutTracker(Node):
         # to absorb the projected-position jitter of far/foreshortened nuts
         # (which otherwise spawn a cloud of phantom nuts), but below the real
         # nut spacing so distinct nuts stay distinct.
-        self.declare_parameter("merge_radius", 0.25)
+        self.declare_parameter("merge_radius", 0.30)
         # Hits before a candidate becomes a confirmed (shown) nut.
         self.declare_parameter("min_hits", 3)
 
