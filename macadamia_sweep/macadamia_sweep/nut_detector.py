@@ -363,6 +363,11 @@ class NutDetector(Node):
         if self.frame_count % self.process_every_n != 0:
             return
 
+        # Re-read live so the floor-plane height can be CALIBRATED with
+        # `ros2 param set /nut_detector ground_z ...` without relaunching.
+        # (raise it to ~the nut plane if projected sizes/ranges read too big.)
+        self.ground_z = float(self.get_parameter("ground_z").value)
+
         bgr = image_to_bgr(msg)
         if bgr is None:
             self.get_logger().warn(
