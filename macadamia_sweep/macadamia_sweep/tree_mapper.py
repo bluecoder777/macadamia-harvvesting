@@ -69,8 +69,13 @@ class TreeMapper(Node):
         self.declare_parameter("tree_max_range", 2.50)
         # Clustering + noodle-size filter.
         self.declare_parameter("cluster_gap", 0.12)       # m between neighbours
-        self.declare_parameter("tree_max_extent", 0.22)   # m, a noodle is small
+        self.declare_parameter("tree_max_extent", 0.16)   # m, a noodle arc is small
         self.declare_parameter("min_points", 3)
+        # Free-standing check: a real post has free space (background at least
+        # this far behind, or no return at all) on BOTH angular sides. This is
+        # the key clutter discriminator -- it rejects wall / furniture SURFACES,
+        # which continue past the cluster instead of having gaps around them.
+        self.declare_parameter("isolation_gap", 0.20)
         self.declare_parameter("tree_radius", 0.06)       # m, push centroid out
         # Persistence (trees are static -> accumulate).
         self.declare_parameter("merge_radius", 0.20)
@@ -85,6 +90,7 @@ class TreeMapper(Node):
         self.cluster_gap = float(self.get_parameter("cluster_gap").value)
         self.tree_max_extent = float(self.get_parameter("tree_max_extent").value)
         self.min_points = int(self.get_parameter("min_points").value)
+        self.isolation_gap = float(self.get_parameter("isolation_gap").value)
         self.tree_radius = float(self.get_parameter("tree_radius").value)
         self.merge_radius = float(self.get_parameter("merge_radius").value)
         self.min_hits = int(self.get_parameter("min_hits").value)
@@ -114,39 +120,59 @@ class TreeMapper(Node):
     # -----------------------------
 
     def scan_cb(self, msg: LaserScan):
-        # Build gated Cartesian points in the LASER frame.
-        xy: List[Tuple[float, float]] = []
-        for i, r in enumerate(msg.ranges):
-            if math.isnan(r) or math.isinf(r):
-                continue
-            if not (msg.range_min <= r <= msg.range_max):
-                continue
-            if r < self.lidar_min_range or r > self.tree_max_range:
-                continue
-            a = msg.angle_min + i * msg.angle_increment
-            xy.append((r * math.cos(a), r * math.sin(a)))
-        if not xy:
-            return
+        n = len(msg.ranges)
+        rmin, rmax = msg.range_min, msg.range_max
 
-        # Cluster by neighbour distance (scan is angle-ordered).
-        clusters: List[List[Tuple[float, float]]] = []
-        cur = [xy[0]]
-        for p, prev in zip(xy[1:], xy):
-            if math.hypot(p[0] - prev[0], p[1] - prev[1]) <= self.cluster_gap:
-                cur.append(p)
+        def valid(r):
+            return (not (math.isnan(r) or math.isinf(r))) and rmin <= r <= rmax
+
+        def in_window(r):
+            return valid(r) and self.lidar_min_range <= r <= self.tree_max_range
+
+        # Cluster CONSECUTIVE in-window returns (keep the index so we can look
+        # at the neighbours just outside the cluster). A gap (invalid / out of
+        # window) or a big Cartesian jump ends a cluster.
+        clusters: List[List[Tuple[int, float, float, float]]] = []
+        cur: List[Tuple[int, float, float, float]] = []
+        for i in range(n):
+            r = msg.ranges[i]
+            if in_window(r):
+                a = msg.angle_min + i * msg.angle_increment
+                p = (i, r, r * math.cos(a), r * math.sin(a))
+                if cur and math.hypot(p[2] - cur[-1][2], p[3] - cur[-1][3]) > self.cluster_gap:
+                    clusters.append(cur); cur = [p]
+                else:
+                    cur.append(p)
             else:
-                clusters.append(cur); cur = [p]
-        clusters.append(cur)
+                if cur:
+                    clusters.append(cur); cur = []
+        if cur:
+            clusters.append(cur)
 
-        # Keep noodle-sized clusters; centroid + push out by one radius.
         centres_laser: List[Tuple[float, float]] = []
         for c in clusters:
             if len(c) < self.min_points:
                 continue
-            xs = [q[0] for q in c]; ys = [q[1] for q in c]
+            xs = [q[2] for q in c]; ys = [q[3] for q in c]
             extent = max(max(xs) - min(xs), max(ys) - min(ys))
             if extent > self.tree_max_extent:
                 continue
+
+            # FREE-STANDING test: the returns just outside the cluster on each
+            # angular side must be empty or far behind (background). A wall /
+            # furniture surface keeps a similar-range neighbour and is rejected.
+            mean_r = sum(q[1] for q in c) / len(c)
+
+            def neighbour_free(idx):
+                if not (0 <= idx < n):
+                    return True
+                rr = msg.ranges[idx]
+                if not valid(rr):
+                    return True                       # no return -> free space
+                return rr > mean_r + self.isolation_gap   # far background -> free
+            if not (neighbour_free(c[0][0] - 1) and neighbour_free(c[-1][0] + 1)):
+                continue
+
             mx = sum(xs) / len(xs); my = sum(ys) / len(ys)
             d = math.hypot(mx, my)
             if d > 1e-3:                       # push outward by the noodle radius
