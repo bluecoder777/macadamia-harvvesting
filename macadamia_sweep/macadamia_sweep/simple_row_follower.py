@@ -6,10 +6,13 @@ from typing import List, Optional, Tuple
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import TwistStamped, PoseArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Empty, String
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
+from rclpy.time import Time
+import tf2_ros
 
 
 class SimpleRowFollower(Node):
@@ -80,6 +83,48 @@ class SimpleRowFollower(Node):
         self.create_subscription(Empty, "/sweep_start", self.start_callback, 10)
         self.create_subscription(Empty, "/sweep_stop", self.stop_callback, 10)
         self.create_subscription(Empty, "/return_home", self.return_home_callback, 10)
+
+        # ---- Tree-aware collection of uncollected nuts (before return-home) ----
+        # For each missed nut we exit to a sweep-entry point BEHIND the field's
+        # near end (relative to home) on the nut's sweep line, align to the row
+        # direction, then sweep the aisle past the nut. The sweeper is on the
+        # hug side (start_side) at collect_sweep_offset; the nut is collected
+        # by nut_tracker when it passes that sweeper point.
+        self.declare_parameter("collect_before_home", True)
+        self.declare_parameter("nuts_topic", "/nuts/uncollected")
+        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("odom_frame", "odom")
+        self.declare_parameter("collect_sweep_offset", 0.40)   # nut on hug side
+        self.declare_parameter("collect_approach_back", 1.00)  # start sweep this far behind nut
+        self.declare_parameter("collect_sweep_through", 0.60)  # drive this far past the nut
+        self.declare_parameter("collect_field_margin", 0.50)   # entry behind home by this much
+        self.declare_parameter("collect_arrive_tol", 0.15)
+        self.declare_parameter("collect_visit_timeout", 45.0)
+        self.collect_before_home = bool(self.get_parameter("collect_before_home").value)
+        self.nuts_topic = self.get_parameter("nuts_topic").value
+        self.map_frame = self.get_parameter("map_frame").value
+        self.odom_frame = self.get_parameter("odom_frame").value
+        self.collect_sweep_offset = float(self.get_parameter("collect_sweep_offset").value)
+        self.collect_approach_back = float(self.get_parameter("collect_approach_back").value)
+        self.collect_sweep_through = float(self.get_parameter("collect_sweep_through").value)
+        self.collect_field_margin = float(self.get_parameter("collect_field_margin").value)
+        self.collect_arrive_tol = float(self.get_parameter("collect_arrive_tol").value)
+        self.collect_visit_timeout = float(self.get_parameter("collect_visit_timeout").value)
+
+        self.uncollected_map: List[Tuple[float, float]] = []   # nut positions (map frame)
+        self._collect_skip = set()                             # unreachable nuts to ignore
+        self._collect_target: Optional[Tuple[float, float]] = None
+        self._collect_phase = "EXIT"
+        self._collect_deadline: Optional[float] = None
+
+        latched = QoSProfile(depth=1)
+        latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        latched.history = HistoryPolicy.KEEP_LAST
+        self.create_subscription(
+            PoseArray, self.nuts_topic, self.uncollected_callback, latched)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.latest_scan: Optional[LaserScan] = None
         self.odom_x: Optional[float] = None
@@ -242,9 +287,20 @@ class SimpleRowFollower(Node):
         self.return_max_duration = float(
             self.get_parameter("return_max_duration").value
         )
+        # How far BEYOND the field's near (start) end to exit before crossing
+        # to the start point. The robot first backs out of its aisle along the
+        # row direction until it clears the tree rows, then drives to home in
+        # the open ground - so the cross-over never cuts through a tree row.
+        self.declare_parameter("return_exit_margin", 0.60)
+        self.return_exit_margin = float(
+            self.get_parameter("return_exit_margin").value
+        )
         self.return_linear_speed = 0.07
         self.return_max_angular = 0.35
         self.return_heading_slowdown = math.radians(35.0)
+        # RETURN_HOME runs in two phases: "OUT" (exit the field) then "GOAL"
+        # (drive to the saved start pose).
+        self._home_phase = "GOAL"
 
         # -----------------------------
         # FRONT OBSTACLE AVOIDANCE
@@ -392,9 +448,11 @@ class SimpleRowFollower(Node):
         self.arc_last_yaw = None
         self.arc_accumulated_yaw = 0.0
         self.stop_robot()
+        self._home_phase = "OUT"
         self.set_state(
             "RETURN_HOME",
-            f"Manual return-home requested. Returning to x={self.home_x:+.2f}, y={self.home_y:+.2f}."
+            f"Manual return-home requested. Exiting the field, then returning to "
+            f"x={self.home_x:+.2f}, y={self.home_y:+.2f}."
         )
         self.get_logger().warn("Manual return-home requested")
 
@@ -1087,19 +1145,31 @@ class SimpleRowFollower(Node):
     # -----------------------------
 
     def finish_or_return_home(self, reason: str):
-        """Go to RETURN_HOME if enabled, otherwise finish immediately."""
+        """Collect any uncollected nuts first (if enabled), then return home."""
         self.stop_robot()
-        if self.return_home_enabled:
-            if self.home_x is None or self.home_y is None:
-                self.set_state(
-                    "DONE",
-                    reason + " Cannot return home because start odom was not saved."
-                )
-            else:
-                self.set_state(
-                    "RETURN_HOME",
-                    reason + f" Returning to start x={self.home_x:+.2f}, y={self.home_y:+.2f}."
-                )
+        if self.collect_before_home and self.uncollected_map:
+            self._collect_skip = set()
+            self._collect_target = None
+            self._collect_phase = "EXIT"
+            self._collect_deadline = None
+            self.set_state(
+                "COLLECT_NUTS",
+                reason + f" Collecting {len(self.uncollected_map)} uncollected nut(s) "
+                f"before home."
+            )
+            return
+        self._go_home(reason)
+
+    def _go_home(self, reason: str):
+        """Drive to the saved start pose if return-home is enabled, else finish."""
+        self.stop_robot()
+        if self.return_home_enabled and self.home_x is not None and self.home_y is not None:
+            self._home_phase = "OUT"
+            self.set_state(
+                "RETURN_HOME",
+                reason + f" Exiting the field, then returning to start "
+                f"x={self.home_x:+.2f}, y={self.home_y:+.2f}."
+            )
         else:
             self.set_state("DONE", reason + " Mission complete.")
 
@@ -1128,11 +1198,60 @@ class SimpleRowFollower(Node):
             )
             return
 
+        # Phase 1 (OUT): back out of the field along the row direction until the
+        # robot is clear of the near (start) end, so the cross-over to the start
+        # point happens in open ground instead of cutting across the tree rows.
+        # Needs the row-direction anchor; without it, skip straight to GOAL.
+        if self._home_phase == "OUT":
+            if self.outbound_yaw is None:
+                self._home_phase = "GOAL"
+            else:
+                ddx, ddy = math.cos(self.outbound_yaw), math.sin(self.outbound_yaw)
+                home_long = self.home_x * ddx + self.home_y * ddy
+                robot_long = self.odom_x * ddx + self.odom_y * ddy
+                out_long = home_long - self.return_exit_margin
+                if robot_long <= out_long + self.return_goal_tolerance:
+                    # Already clear of the field's near end.
+                    self._home_phase = "GOAL"
+                else:
+                    # Target: current position projected back to the exit line,
+                    # so this phase drives purely along the aisle (no lateral
+                    # correction that would steer into a row).
+                    step = out_long - robot_long      # negative -> along -row dir
+                    tx = self.odom_x + step * ddx
+                    ty = self.odom_y + step * ddy
+                    ex = tx - self.odom_x
+                    ey = ty - self.odom_y
+                    edist = math.hypot(ex, ey)
+                    target_yaw = math.atan2(ey, ex)
+                    heading_error = self.normalize_angle(target_yaw - self.odom_yaw)
+                    if abs(heading_error) > self.return_heading_slowdown:
+                        self.publish_cmd(
+                            0.0, math.copysign(self.return_max_angular, heading_error))
+                    else:
+                        linear = min(self.return_linear_speed, max(0.03, 0.45 * edist))
+                        angular = max(-self.return_max_angular,
+                                      min(self.return_max_angular, 1.4 * heading_error))
+                        self.publish_cmd(linear, angular)
+                    self.publish_status(
+                        f"RETURN_HOME exiting field | out_dist={edist:.2f}m "
+                        f"| heading_err={math.degrees(heading_error):+.0f}deg "
+                        f"| front={front:.2f}m"
+                    )
+                    if self.elapsed_in_state() > self.return_max_duration:
+                        self.set_state(
+                            "DONE",
+                            f"RETURN_HOME timeout after {self.return_max_duration:.0f}s "
+                            f"while exiting field. Robot stopped."
+                        )
+                        self.stop_robot()
+                    return
+
         dx = self.home_x - self.odom_x
         dy = self.home_y - self.odom_y
         dist = math.hypot(dx, dy)
 
-        # First reach the saved x/y position.
+        # Phase 2 (GOAL): reach the saved x/y position.
         if dist > self.return_goal_tolerance:
             target_yaw = math.atan2(dy, dx)
             heading_error = self.normalize_angle(target_yaw - self.odom_yaw)
@@ -1192,6 +1311,208 @@ class SimpleRowFollower(Node):
         )
 
     # -----------------------------
+    # COLLECT_NUTS - tree-aware pickup of missed nuts before home
+    # -----------------------------
+
+    def uncollected_callback(self, msg: PoseArray):
+        self.uncollected_map = [(p.position.x, p.position.y) for p in msg.poses]
+
+    def _map_to_odom(self):
+        """(tx, ty, cos, sin) of the odom<-map transform, or None."""
+        try:
+            tf = self.tf_buffer.lookup_transform(self.odom_frame, self.map_frame, Time())
+        except Exception:
+            return None
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return (t.x, t.y, math.cos(yaw), math.sin(yaw))
+
+    @staticmethod
+    def _apply_tf(mx, my, tf):
+        tx, ty, c, s = tf
+        return (tx + c * mx - s * my, ty + s * mx + c * my)
+
+    def _uncollected_targets(self, tf):
+        out = []
+        for (mx, my) in self.uncollected_map:
+            if (round(mx, 2), round(my, 2)) in self._collect_skip:
+                continue
+            out.append(((mx, my), self._apply_tf(mx, my, tf)))
+        return out
+
+    def _row_units(self):
+        """(d, sweeper_unit) in odom: d along the row, sweeper_unit toward the
+        hug side. None if the heading anchor isn't set."""
+        if self.outbound_yaw is None:
+            return None
+        th = self.outbound_yaw
+        d = (math.cos(th), math.sin(th))
+        if self.start_side == "left":
+            sw = (-math.sin(th), math.cos(th))   # left of d
+        else:
+            sw = (math.sin(th), -math.cos(th))   # right of d
+        return d, sw
+
+    def _sweep_entry(self, nox, noy):
+        """Entry point (odom) for sweeping nut at (nox,noy): on the nut's sweep
+        line (offset so the nut ends up sweep_offset on the hug side), pulled
+        back along the row to BEHIND the field's near end (home), so the run-in
+        approaches from outside instead of cutting across rows."""
+        units = self._row_units()
+        if units is None or self.home_x is None:
+            return None
+        (dx, dy), (sx, sy) = units
+        # Robot sweep-line point: nut minus the sweeper offset.
+        lx = nox - self.collect_sweep_offset * sx
+        ly = noy - self.collect_sweep_offset * sy
+        l_long = lx * dx + ly * dy
+        home_long = self.home_x * dx + self.home_y * dy
+        target_long = min(l_long - self.collect_approach_back,
+                          home_long - self.collect_field_margin)
+        back = target_long - l_long      # <= -approach_back, moves E behind the field
+        return (lx + back * dx, ly + back * dy)
+
+    def _drive_to(self, tx: float, ty: float, tol: float) -> bool:
+        """Go-to-point with the RETURN_HOME control style + AVOID_FRONT safety.
+        Returns True when within tol."""
+        if self.odom_x is None or self.odom_yaw is None:
+            self.stop_robot()
+            return False
+        front = self.get_front_distance()
+        if front < self.emergency_stop_distance:
+            self.stop_robot()
+            return False
+        if front < self.avoid_front_distance:
+            self.enter_avoid_front("COLLECT_NUTS", f"front={front:.2f}m during collect")
+            return False
+        dx = tx - self.odom_x
+        dy = ty - self.odom_y
+        dist = math.hypot(dx, dy)
+        if dist <= tol:
+            self.stop_robot()
+            return True
+        he = self.normalize_angle(math.atan2(dy, dx) - self.odom_yaw)
+        if abs(he) > self.return_heading_slowdown:
+            self.publish_cmd(0.0, math.copysign(self.return_max_angular, he))
+        else:
+            lin = min(self.return_linear_speed, max(0.03, 0.45 * dist))
+            ang = max(-self.return_max_angular, min(self.return_max_angular, 1.4 * he))
+            self.publish_cmd(lin, ang)
+        return False
+
+    def _sweep_forward(self, heading: float):
+        """Drive forward at sweep speed holding `heading` (front-safe)."""
+        front = self.get_front_distance()
+        if front < self.emergency_stop_distance:
+            self.stop_robot()
+            return
+        if front < self.avoid_front_distance:
+            self.enter_avoid_front("COLLECT_NUTS", f"front={front:.2f}m during sweep")
+            return
+        he = self.normalize_angle(heading - self.odom_yaw)
+        ang = max(-self.max_follow_angular, min(self.max_follow_angular, self.k_heading * he))
+        self.publish_cmd(self.forward_speed, ang)
+
+    def collect_nuts(self):
+        if self.odom_x is None or self.odom_yaw is None:
+            self.stop_robot()
+            self.publish_status("COLLECT_NUTS waiting for odometry")
+            return
+        tf = self._map_to_odom()
+        if tf is None:
+            self.stop_robot()
+            self.publish_status("COLLECT_NUTS waiting for map->odom TF")
+            return
+        if self._row_units() is None:
+            self._go_home("COLLECT_NUTS: no row heading anchor.")
+            return
+
+        now = self.get_clock().now().nanoseconds * 1e-9
+
+        # Is the current target still an uncollected, non-skipped nut?
+        valid = False
+        if self._collect_target is not None:
+            key = (round(self._collect_target[0], 2), round(self._collect_target[1], 2))
+            valid = key not in self._collect_skip and any(
+                (round(mx, 2), round(my, 2)) == key for (mx, my) in self.uncollected_map)
+        if not valid:
+            targets = self._uncollected_targets(tf)
+            if not targets:
+                self._go_home("All reachable nuts collected.")
+                return
+            targets.sort(key=lambda t: math.hypot(t[1][0] - self.odom_x,
+                                                  t[1][1] - self.odom_y))
+            self._collect_target = targets[0][0]
+            self._collect_phase = "EXIT"
+            self._collect_deadline = now + self.collect_visit_timeout
+
+        # Give up on a nut we can't service in time.
+        if self._collect_deadline is not None and now > self._collect_deadline:
+            self._collect_skip.add((round(self._collect_target[0], 2),
+                                    round(self._collect_target[1], 2)))
+            self.get_logger().warn(
+                f"COLLECT_NUTS: skipping nut "
+                f"({self._collect_target[0]:+.2f},{self._collect_target[1]:+.2f})"
+            )
+            self._collect_target = None
+            return
+
+        nox, noy = self._apply_tf(self._collect_target[0], self._collect_target[1], tf)
+        (dx, dy), _ = self._row_units()
+
+        if self._collect_phase == "EXIT":
+            entry = self._sweep_entry(nox, noy)
+            if entry is None:
+                self._collect_target = None
+                return
+            if self._drive_to(entry[0], entry[1], self.collect_arrive_tol):
+                self._collect_phase = "ALIGN"
+                self._collect_deadline = now + self.collect_visit_timeout
+            else:
+                self.publish_status(
+                    f"COLLECT EXIT -> ({entry[0]:+.2f},{entry[1]:+.2f}) | "
+                    f"nut=({nox:+.2f},{noy:+.2f})"
+                )
+            return
+
+        if self._collect_phase == "ALIGN":
+            err = self.normalize_angle(self.outbound_yaw - self.odom_yaw)
+            if abs(err) < self.align_parallel_tol:
+                self.stop_robot()
+                self._collect_phase = "SWEEP"
+                self._collect_deadline = now + self.collect_visit_timeout
+            else:
+                mag = min(self.align_max_angular,
+                          max(self.min_align_angular, self.k_align * abs(err)))
+                self.publish_cmd(0.0, math.copysign(mag, err))
+                self.publish_status(
+                    f"COLLECT ALIGN | err={math.degrees(err):+.0f}deg")
+            return
+
+        if self._collect_phase == "SWEEP":
+            robot_long = self.odom_x * dx + self.odom_y * dy
+            nut_long = nox * dx + noy * dy
+            # The nut is collected (and drops off the list) when the sweeper
+            # passes it; that flips `valid` False next tick and we pick the
+            # next one. This is the fallback if we drive past without a pickup.
+            if robot_long >= nut_long + self.collect_sweep_through:
+                self._collect_skip.add((round(self._collect_target[0], 2),
+                                        round(self._collect_target[1], 2)))
+                self.get_logger().warn(
+                    "COLLECT_NUTS: swept past without pickup; skipping.")
+                self._collect_target = None
+                self.stop_robot()
+                return
+            self._sweep_forward(self.outbound_yaw)
+            self.publish_status(
+                f"COLLECT SWEEP | nut=({nox:+.2f},{noy:+.2f}) | "
+                f"{(nut_long - robot_long):+.2f}m to abeam"
+            )
+            return
+
+    # -----------------------------
     # State machine
     # -----------------------------
 
@@ -1226,6 +1547,10 @@ class SimpleRowFollower(Node):
 
         if self.state == "FOLLOW_OUT":
             self.follow_side(self.current_side)
+            if self.state != "FOLLOW_OUT":
+                # follow_side handed off to AVOID_FRONT; let it run instead of
+                # overriding it with an end-of-row transition this tick.
+                return
             abeam = self.last_tree_abeam_or_behind(self.current_side)
             lost = self.should_end_pass()
             if abeam or lost:
@@ -1256,6 +1581,10 @@ class SimpleRowFollower(Node):
 
         elif self.state == "FOLLOW_BACK":
             self.follow_side(self.current_side)
+            if self.state != "FOLLOW_BACK":
+                # follow_side handed off to AVOID_FRONT; let it run instead of
+                # overriding it with an end-of-row transition this tick.
+                return
 
             # While sweeping back, the NEXT row (if any) sits on the
             # opposite side of the robot. Count confident fits so the
@@ -1307,6 +1636,9 @@ class SimpleRowFollower(Node):
 
         elif self.state == "AVOID_FRONT":
             self.avoid_front_obstacle()
+
+        elif self.state == "COLLECT_NUTS":
+            self.collect_nuts()
 
         elif self.state == "RETURN_HOME":
             self.return_home()

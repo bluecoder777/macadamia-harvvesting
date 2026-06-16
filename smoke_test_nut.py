@@ -323,6 +323,7 @@ def make_tracker():
     t.map_frame = "map"; t.robot_frame = "base_link"
     t.marker_ns = "nuts"; t.marker_diameter = 0.08
     t.use_tree_gate = False; t.tree_gate_radius = 0.50; t.tree_pts = []
+    t.sweep_offset = 0.40; t.sweep_side = "right"
     return t
 
 trk = make_tracker()
@@ -372,17 +373,22 @@ class _Pub:
     def publish(self, m):
         self.last = m
 class _TF:
-    def __init__(self, x, y):
-        self.x = x; self.y = y
+    def __init__(self, x, y, yaw=0.0):
+        self.x = x; self.y = y; self.yaw = yaw
     def lookup_transform(self, target, source, t):
         ns = types.SimpleNamespace
-        return ns(transform=ns(translation=ns(x=self.x, y=self.y, z=0.0)))
+        qz = math.sin(self.yaw / 2.0); qw = math.cos(self.yaw / 2.0)
+        return ns(transform=ns(
+            translation=ns(x=self.x, y=self.y, z=0.0),
+            rotation=ns(x=0.0, y=0.0, z=qz, w=qw)))
 
 trk.get_clock = lambda: _Clk()
 trk.get_logger = lambda: _Log()
 trk.uncollected_pub = _Pub(); trk.status_pub = _Pub(); trk.marker_pub = _Pub()
-# Robot drives onto the confirmed nut #0 (at ~1.02,1.00).
-trk.tf_buffer = _TF(1.02, 1.00)
+# The sweeper is offset 0.40 m to the hug side (right). With yaw=0 the sweeper
+# sits at (rx, ry-0.40), so to drive the sweeper onto nut #0 (~1.02,1.00) the
+# robot body must be at (1.02, 1.40).
+trk.tf_buffer = _TF(1.02, 1.40)
 trk.collection_tick()
 check("nut under the robot becomes collected", trk.nuts[0].collected is True)
 check("far nut stays uncollected", trk.nuts[1].collected is False)
@@ -397,6 +403,20 @@ fx0, fy0 = trk.nuts[0].x, trk.nuts[0].y
 trk.associate(1.20, 1.20)   # near-ish the collected nut
 check("collected nut position is frozen", approx(trk.nuts[0].x, fx0, 1e-9)
       and approx(trk.nuts[0].y, fy0, 1e-9))
+
+# A nut directly under the ROBOT BODY (not the offset sweeper) is also
+# collected - the body sweeps it up too. Robot at (3.0,3.0); its right-side
+# sweeper is 0.40 m away at (3.0,2.60), nowhere near the nut at (3.0,3.0).
+trk2 = make_tracker()
+trk2.get_clock = lambda: _Clk()
+trk2.get_logger = lambda: _Log()
+trk2.uncollected_pub = _Pub(); trk2.status_pub = _Pub(); trk2.marker_pub = _Pub()
+for _ in range(3):
+    trk2.associate(3.00, 3.00)   # confirm a nut under the robot centre
+trk2.tf_buffer = _TF(3.00, 3.00)
+trk2.collection_tick()
+check("nut under the robot BODY is collected (not just the sweeper)",
+      trk2.nuts[0].collected is True)
 
 # ===========================================================================
 print("=== nut_tracker: marker colours ===")

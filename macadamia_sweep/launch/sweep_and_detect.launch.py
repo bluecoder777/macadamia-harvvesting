@@ -90,6 +90,10 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "map_frame": target_frame,
+                # The sweeper is on the hug side, which is the side the follower
+                # starts on. Keep them in lock-step so the collection point and
+                # the pickup geometry never disagree.
+                "sweep_side": start_side,
             }],
         ),
 

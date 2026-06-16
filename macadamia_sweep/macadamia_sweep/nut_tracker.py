@@ -89,9 +89,14 @@ class NutTracker(Node):
         self.declare_parameter("trees_topic", "/trees")
 
         # ---- Collection ----
-        # Robot "sweeps up" a nut when base_link passes within this radius.
-        # ~ half the robot footprint / brush width. Tune to your sweeper.
+        # The sweeper is offset to the hug side of the robot (it sweeps the side
+        # the robot hugs the tree line with), so a nut is collected when it
+        # passes within collection_radius of the SWEEPER point, not the robot
+        # centre. sweeper point = robot + sweep_offset * (hug-side direction).
+        # sweep_offset = 0 reverts to a plain centre drive-over.
         self.declare_parameter("collection_radius", 0.25)
+        self.declare_parameter("sweep_offset", 0.40)      # m to the hug side
+        self.declare_parameter("sweep_side", "right")     # side the sweeper is on
 
         # ---- Visualisation ----
         self.declare_parameter("marker_diameter", 0.08)   # bigger than 3 cm so it's visible
@@ -110,6 +115,8 @@ class NutTracker(Node):
         self.tree_gate_radius = float(self.get_parameter("tree_gate_radius").value)
         self.trees_topic = self.get_parameter("trees_topic").value
         self.collection_radius = float(self.get_parameter("collection_radius").value)
+        self.sweep_offset = float(self.get_parameter("sweep_offset").value)
+        self.sweep_side = str(self.get_parameter("sweep_side").value).lower()
         self.marker_diameter = float(self.get_parameter("marker_diameter").value)
         self.marker_ns = self.get_parameter("marker_namespace").value
         self.save_path = self.get_parameter("save_path").value
@@ -209,6 +216,7 @@ class NutTracker(Node):
     # -----------------------------
 
     def robot_xy(self) -> Optional[tuple]:
+        """Robot centre in the map frame, or None if TF is unavailable."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, self.robot_frame, Time()
@@ -217,17 +225,41 @@ class NutTracker(Node):
             return None
         return (tf.transform.translation.x, tf.transform.translation.y)
 
+    def sweeper_xy(self) -> Optional[tuple]:
+        """The sweeper point: robot centre + sweep_offset to the hug side.
+        Uses the robot's heading so the offset is in the correct world
+        direction. Returns None if TF is unavailable."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, self.robot_frame, Time()
+            )
+        except Exception:
+            return None
+        rx = tf.transform.translation.x
+        ry = tf.transform.translation.y
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        # Right of the robot = (sin yaw, -cos yaw); left = (-sin yaw, cos yaw).
+        if self.sweep_side == "left":
+            ux, uy = -math.sin(yaw), math.cos(yaw)
+        else:
+            ux, uy = math.sin(yaw), -math.cos(yaw)
+        return (rx + self.sweep_offset * ux, ry + self.sweep_offset * uy)
+
     def collection_tick(self):
-        rxy = self.robot_xy()
-        if rxy is None:
+        # A nut is collected if it passes under the SWEEPER (offset to the hug
+        # side) OR directly under the ROBOT body - both sweep it up.
+        points = [p for p in (self.robot_xy(), self.sweeper_xy()) if p is not None]
+        if not points:
             return
-        rx, ry = rxy
         changed = False
         now = self.get_clock().now().nanoseconds * 1e-9
         for n in self.nuts:
             if n.collected or n.hits < self.min_hits:
                 continue
-            if math.hypot(n.x - rx, n.y - ry) <= self.collection_radius:
+            if any(math.hypot(n.x - px, n.y - py) <= self.collection_radius
+                   for (px, py) in points):
                 n.collected = True
                 n.collected_t = now
                 changed = True
