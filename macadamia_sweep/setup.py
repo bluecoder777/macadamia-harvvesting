@@ -28,6 +28,7 @@ setup(
     'nut_detector = macadamia_sweep.nut_detector:main',
     'nut_tracker = macadamia_sweep.nut_tracker:main',
     'tree_mapper = macadamia_sweep.tree_mapper:main',
+    'harvest_dashboard = macadamia_sweep.harvest_dashboard:main',
 ],
     },
 )
