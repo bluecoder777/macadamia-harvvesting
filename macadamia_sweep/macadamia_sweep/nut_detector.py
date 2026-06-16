@@ -57,6 +57,7 @@ from rclpy.time import Time
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseArray, Pose
+from nav_msgs.msg import Odometry
 
 import tf2_ros
 
@@ -235,6 +236,13 @@ class NutDetector(Node):
 
         self.declare_parameter("publish_debug", True)
 
+        # ---- Suppress detection while TURNING ----
+        # Motion blur + the fast viewpoint change during a turn corrupt the
+        # projected positions, so skip frames when the measured angular velocity
+        # exceeds this (rad/s). Set <= 0 to disable suppression.
+        self.declare_parameter("max_turn_rate", 0.30)
+        self.declare_parameter("odom_topic", "/odometry/filtered")
+
         self.min_area = float(self.get_parameter("min_area_px").value)
         self.max_area = float(self.get_parameter("max_area_px").value)
         self.min_solidity = float(self.get_parameter("min_solidity").value)
@@ -249,6 +257,8 @@ class NutDetector(Node):
         self.depth_floor_tol = float(self.get_parameter("depth_floor_tolerance").value)
         self.roi_top_fraction = float(self.get_parameter("roi_top_fraction").value)
         self.morph_px = max(1, int(self.get_parameter("morph_px").value))
+        self.max_turn_rate = float(self.get_parameter("max_turn_rate").value)
+        self.odom_topic = self.get_parameter("odom_topic").value
         self.min_range = float(self.get_parameter("min_range").value)
         self.max_range = float(self.get_parameter("max_range").value)
         self.process_every_n = max(1, int(self.get_parameter("process_every_n").value))
@@ -284,6 +294,13 @@ class NutDetector(Node):
         if self.use_depth_gate:
             self.create_subscription(
                 Image, self.depth_topic, self.depth_callback, 10
+            )
+
+        # Latest measured angular velocity, for the turn-suppression gate.
+        self._ang_vel = 0.0
+        if self.max_turn_rate > 0.0:
+            self.create_subscription(
+                Odometry, self.odom_topic, self.odom_callback, 20
             )
 
         self.frame_count = 0
@@ -325,9 +342,13 @@ class NutDetector(Node):
             f"depth-gate ON ({self.depth_topic}, tol {self.depth_floor_tol:.2f}m)"
             if self.use_depth_gate else "depth-gate OFF"
         )
+        turn_str = (
+            f"turn-suppress > {self.max_turn_rate:.2f} rad/s"
+            if self.max_turn_rate > 0.0 else "turn-suppress OFF"
+        )
         self.get_logger().info(
             f"nut_detector up. rgb={self.rgb_topic} -> {self.target_frame}. "
-            f"{mode_str}. {depth_str}. Tune against /nuts/debug_image."
+            f"{mode_str}. {depth_str}. {turn_str}. Tune against /nuts/debug_image."
         )
 
     # -----------------------------
@@ -346,6 +367,9 @@ class NutDetector(Node):
                 f"camera_info locked: fx={self.fx:.1f} fy={self.fy:.1f} "
                 f"cx={self.cx:.1f} cy={self.cy:.1f} ({msg.width}x{msg.height})"
             )
+
+    def odom_callback(self, msg: Odometry):
+        self._ang_vel = msg.twist.twist.angular.z
 
     def depth_callback(self, msg: Image):
         depth = depth_to_metres(msg)
@@ -368,6 +392,21 @@ class NutDetector(Node):
             self.get_logger().warn(
                 f"Unhandled image encoding '{msg.encoding}'", throttle_duration_sec=5.0
             )
+            return
+
+        # Suppress detection while turning (blur + fast viewpoint change corrupt
+        # the projected positions). Publish empty detections + a labelled frame.
+        if self.max_turn_rate > 0.0 and abs(self._ang_vel) > self.max_turn_rate:
+            empty = PoseArray()
+            empty.header.stamp = msg.header.stamp
+            empty.header.frame_id = self.target_frame
+            self.det_pub.publish(empty)
+            if self.debug_pub is not None:
+                vis = bgr.copy()
+                cv2.putText(
+                    vis, f"TURNING ({self._ang_vel:+.2f} rad/s) - detection suppressed",
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                self._publish_image_bgr(vis, msg.header.stamp)
             return
 
         mask = self.colour_mask(bgr)
@@ -680,7 +719,9 @@ class NutDetector(Node):
             vis, f"{self._debug_tint_label} | {parts or 'no blobs'}",
             (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2,
         )
+        self._publish_image_bgr(vis, stamp)
 
+    def _publish_image_bgr(self, vis, stamp):
         out = Image()
         out.header.stamp = stamp
         out.header.frame_id = "oak_rgb_camera_optical_frame"

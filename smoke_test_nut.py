@@ -120,6 +120,8 @@ class _MarkerArray:
 geo = _mod("geometry_msgs"); _mod("geometry_msgs.msg")
 sys.modules["geometry_msgs.msg"].PoseArray = _PoseArray
 sys.modules["geometry_msgs.msg"].Pose = _Pose
+_mod("nav_msgs"); _mod("nav_msgs.msg")
+sys.modules["nav_msgs.msg"].Odometry = type("Odometry", (), {})
 sens = _mod("sensor_msgs"); _mod("sensor_msgs.msg")
 sys.modules["sensor_msgs.msg"].Image = _Image
 sys.modules["sensor_msgs.msg"].CameraInfo = _CameraInfo
