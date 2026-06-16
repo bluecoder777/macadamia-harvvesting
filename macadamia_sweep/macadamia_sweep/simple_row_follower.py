@@ -62,12 +62,12 @@ class SimpleRowFollower(Node):
         # Obstacle avoidance parameters
         # ------------------------------------------------------------------
         # warn zone: avoidance kicks in here, well before the hard stop.
-        self.declare_parameter("obstacle_warn_distance", 0.30)
+        self.declare_parameter("obstacle_warn_distance", 0.15)
         self.obstacle_warn_distance = float(
             self.get_parameter("obstacle_warn_distance").value
         )
         # resume when obstacle has retreated to this distance.
-        self.declare_parameter("avoid_resume_distance", 0.45)
+        self.declare_parameter("avoid_resume_distance", 0.30)
         self.avoid_resume_distance = float(
             self.get_parameter("avoid_resume_distance").value
         )
