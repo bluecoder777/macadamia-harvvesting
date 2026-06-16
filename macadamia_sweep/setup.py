@@ -13,6 +13,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
         (os.path.join("share", package_name, "worlds"), glob("worlds/*.world")),
+        (os.path.join("share", package_name, "rviz"), glob("rviz/*.rviz")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -24,6 +25,10 @@ setup(
         'console_scripts': [
     'simple_row_follower = macadamia_sweep.simple_row_follower:main',
     'sweep_logger = macadamia_sweep.sweep_logger:main',
+    'nut_detector = macadamia_sweep.nut_detector:main',
+    'nut_tracker = macadamia_sweep.nut_tracker:main',
+    'tree_mapper = macadamia_sweep.tree_mapper:main',
+    'harvest_dashboard = macadamia_sweep.harvest_dashboard:main',
 ],
     },
 )
