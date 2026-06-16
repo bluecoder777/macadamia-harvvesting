@@ -246,6 +246,29 @@ class SimpleRowFollower(Node):
         self.return_max_angular = 0.35
         self.return_heading_slowdown = math.radians(35.0)
 
+        # -----------------------------
+        # FRONT OBSTACLE AVOIDANCE
+        # -----------------------------
+        # avoid_front_distance is the early warning distance. When the
+        # front LiDAR sees something closer than this, the robot performs
+        # a small recovery manoeuvre instead of continuing into the tree.
+        self.declare_parameter("avoid_front_distance", 0.28)
+        self.avoid_front_distance = float(
+            self.get_parameter("avoid_front_distance").value
+        )
+
+        self.avoid_backup_speed = -0.04
+        self.avoid_turn_speed = 0.28
+        self.avoid_forward_speed = 0.05
+
+        self.avoid_backup_duration = 1.2
+        self.avoid_turn_duration = 1.8
+        self.avoid_forward_duration = 1.8
+
+        self.avoid_previous_state = "FOLLOW_OUT"
+        self.avoid_phase = "BACKUP"
+        self.avoid_phase_start_time = self.get_clock().now()
+
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.publish_status("Simple row follower ready. Publish /sweep_start to begin.")
@@ -256,7 +279,8 @@ class SimpleRowFollower(Node):
             f"max_rows={self.max_rows or 'unlimited'}, "
             f"row_group_gap={self.row_group_gap:.2f}m, "
             f"lidar_yaw_offset={math.degrees(self.lidar_yaw_offset):+.0f}deg, "
-            f"return_home={self.return_home_enabled}, manual_topic=/return_home"
+            f"return_home={self.return_home_enabled}, manual_topic=/return_home, "
+            f"avoid_front={self.avoid_front_distance:.2f}m"
         )
 
     # -----------------------------
@@ -628,6 +652,13 @@ class SimpleRowFollower(Node):
             self.publish_status(f"EMERGENCY STOP: front={front:.2f} m")
             return
 
+        if front < self.avoid_front_distance:
+            self.enter_avoid_front(
+                self.state,
+                f"front={front:.2f}m"
+            )
+            return
+
         visible, fit = self.row_visible(side)
         self.mark_row_seen_if_visible(visible)
 
@@ -942,6 +973,116 @@ class SimpleRowFollower(Node):
         self.set_state("FOLLOW_OUT", status)
 
     # -----------------------------
+    # FRONT OBSTACLE AVOIDANCE
+    # -----------------------------
+
+    def enter_avoid_front(self, from_state: str, reason: str = ""):
+        """Enter front-obstacle avoidance, then return to the previous state."""
+        self.avoid_previous_state = from_state
+        self.avoid_phase = "BACKUP"
+        self.avoid_phase_start_time = self.get_clock().now()
+        self.stop_robot()
+        self.set_state(
+            "AVOID_FRONT",
+            f"Front obstacle detected. Avoiding before continuing {from_state}. {reason}"
+        )
+
+    def elapsed_in_avoid_phase(self) -> float:
+        return (self.get_clock().now() - self.avoid_phase_start_time).nanoseconds / 1e9
+
+    def set_avoid_phase(self, phase: str):
+        self.avoid_phase = phase
+        self.avoid_phase_start_time = self.get_clock().now()
+        self.get_logger().info(f"AVOID_FRONT phase changed to {phase}")
+
+    def get_sector_distance(self, min_deg: float, max_deg: float) -> float:
+        """Return nearest valid LiDAR distance in an angle sector."""
+        scan = self.latest_scan
+        if scan is None:
+            return 10.0
+
+        vals = []
+        min_a = math.radians(min_deg)
+        max_a = math.radians(max_deg)
+
+        for i, r in enumerate(scan.ranges):
+            angle = scan.angle_min + i * scan.angle_increment + self.lidar_yaw_offset
+            angle = self.normalize_angle(angle)
+
+            if min_a <= angle <= max_a and self.valid_range(r, scan):
+                vals.append(r)
+
+        return min(vals) if vals else 10.0
+
+    def avoid_front_obstacle(self):
+        """Back up, turn away from obstacle, move forward, then resume previous state."""
+        front = self.get_front_distance()
+
+        # If the object is very close, create clearance first.
+        if front < self.emergency_stop_distance:
+            self.publish_cmd(self.avoid_backup_speed, 0.0)
+            self.publish_status(
+                f"AVOID_FRONT emergency backup | front={front:.2f}m"
+            )
+            return
+
+        # During RETURN_HOME, choose the side with more free space.
+        # During row-following, turn away from the current row side.
+        if self.avoid_previous_state == "RETURN_HOME":
+            left_clear = self.get_sector_distance(25, 90)
+            right_clear = self.get_sector_distance(-90, -25)
+            turn_dir = +1.0 if left_clear > right_clear else -1.0
+            side_note = f"left={left_clear:.2f}m right={right_clear:.2f}m"
+        else:
+            turn_dir = +1.0 if self.current_side == "right" else -1.0
+            side_note = f"row_on={self.current_side}"
+
+        if self.avoid_phase == "BACKUP":
+            if self.elapsed_in_avoid_phase() < self.avoid_backup_duration:
+                self.publish_cmd(self.avoid_backup_speed, 0.0)
+                self.publish_status(
+                    f"AVOID_FRONT backup | front={front:.2f}m | {side_note}"
+                )
+                return
+
+            self.set_avoid_phase("TURN_AWAY")
+            return
+
+        if self.avoid_phase == "TURN_AWAY":
+            if self.elapsed_in_avoid_phase() < self.avoid_turn_duration:
+                self.publish_cmd(0.0, turn_dir * self.avoid_turn_speed)
+                self.publish_status(
+                    f"AVOID_FRONT turning away | front={front:.2f}m | {side_note}"
+                )
+                return
+
+            self.set_avoid_phase("FORWARD_CLEAR")
+            return
+
+        if self.avoid_phase == "FORWARD_CLEAR":
+            if self.elapsed_in_avoid_phase() < self.avoid_forward_duration:
+                # Move forward while curving slightly away so the obstacle
+                # leaves the front cone before normal control resumes.
+                self.publish_cmd(
+                    self.avoid_forward_speed,
+                    turn_dir * 0.10
+                )
+                self.publish_status(
+                    f"AVOID_FRONT clearing obstacle | front={front:.2f}m | {side_note}"
+                )
+                return
+
+            # Resume the state that was interrupted. RETURN_HOME will
+            # recalculate the heading to the saved start pose on the next tick.
+            self.last_row_seen_time = self.get_clock().now()
+            self.seen_row_this_pass = False
+            self.set_state(
+                self.avoid_previous_state,
+                f"Obstacle avoided. Resuming {self.avoid_previous_state}."
+            )
+            return
+
+    # -----------------------------
     # RETURN_HOME
     # -----------------------------
 
@@ -977,8 +1118,13 @@ class SimpleRowFollower(Node):
         front = self.get_front_distance()
         if front < self.emergency_stop_distance:
             self.stop_robot()
-            self.publish_status(
-                f"RETURN_HOME blocked: front obstacle {front:.2f}m. Robot stopped."
+            self.publish_status(f"EMERGENCY STOP during RETURN_HOME: front={front:.2f}m")
+            return
+
+        if front < self.avoid_front_distance:
+            self.enter_avoid_front(
+                "RETURN_HOME",
+                f"front={front:.2f}m while returning home"
             )
             return
 
@@ -1158,6 +1304,9 @@ class SimpleRowFollower(Node):
 
         elif self.state == "TURN_NEXT":
             self.turn_to_next_row()
+
+        elif self.state == "AVOID_FRONT":
+            self.avoid_front_obstacle()
 
         elif self.state == "RETURN_HOME":
             self.return_home()
