@@ -48,6 +48,30 @@ def quat_to_R(x: float, y: float, z: float, w: float) -> np.ndarray:
     ])
 
 
+def fit_circle(pts):
+    """Algebraic (Kasa) circle fit. Returns (cx, cy, r) or None if the points
+    are (near-)collinear -- which is exactly what a flat WALL segment looks like
+    (it fails the fit), while a noodle's curved arc fits a small circle."""
+    n = len(pts)
+    if n < 3:
+        return None
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    suu = svv = suv = suuu = svvv = suvv = svuu = 0.0
+    for (x, y) in pts:
+        u = x - mx; v = y - my
+        suu += u * u; svv += v * v; suv += u * v
+        suuu += u * u * u; svvv += v * v * v
+        suvv += u * v * v; svuu += v * u * u
+    det = suu * svv - suv * suv
+    if abs(det) < 1e-10:                # collinear -> a wall, not a cylinder
+        return None
+    uc = (0.5 * (suuu + suvv) * svv - 0.5 * (svvv + svuu) * suv) / det
+    vc = (0.5 * (svvv + svuu) * suu - 0.5 * (suuu + suvv) * suv) / det
+    r = math.sqrt(uc * uc + vc * vc + (suu + svv) / n)
+    return uc + mx, vc + my, r
+
+
 class Tree:
     __slots__ = ("x", "y", "hits")
 
@@ -66,20 +90,30 @@ class TreeMapper(Node):
         # Lidar gating: ignore returns off the robot body, and only trust trees
         # within tree_max_range (point density falls off with distance).
         self.declare_parameter("lidar_min_range", 0.20)
-        self.declare_parameter("tree_max_range", 2.50)
+        # Only trust NEARBY trees: at range the arc is sparse/noisy and walls
+        # masquerade as posts. The nuts are near nearby trees anyway.
+        self.declare_parameter("tree_max_range", 1.50)
         # Clustering + noodle-size filter.
         self.declare_parameter("cluster_gap", 0.12)       # m between neighbours
         self.declare_parameter("tree_max_extent", 0.16)   # m, a noodle arc is small
-        self.declare_parameter("min_points", 3)
+        # Higher: a grazing wall returns a sparse cluster (few far-apart points),
+        # a near noodle returns a dense arc.
+        self.declare_parameter("min_points", 5)
+        # Circle-fit radius band (m): the cluster must be shaped like a ~6 cm
+        # cylinder. A flat wall is collinear (fit fails) or fits a huge radius.
+        self.declare_parameter("min_circle_radius", 0.02)
+        self.declare_parameter("max_circle_radius", 0.13)
         # Free-standing check: a real post has free space (background at least
         # this far behind, or no return at all) on BOTH angular sides. This is
         # the key clutter discriminator -- it rejects wall / furniture SURFACES,
         # which continue past the cluster instead of having gaps around them.
         self.declare_parameter("isolation_gap", 0.20)
         self.declare_parameter("tree_radius", 0.06)       # m, push centroid out
-        # Persistence (trees are static -> accumulate).
-        self.declare_parameter("merge_radius", 0.20)
-        self.declare_parameter("min_hits", 4)
+        # Persistence (trees are static -> accumulate). Higher min_hits + wider
+        # merge: confirm only repeatedly-seen posts, and fuse a real noodle's
+        # jittered re-detections into one instead of many duplicates.
+        self.declare_parameter("merge_radius", 0.30)
+        self.declare_parameter("min_hits", 6)
         # Acceptance-zone radius drawn in RViz (match tree_gate_radius in tracker).
         self.declare_parameter("zone_radius", 0.50)
 
@@ -90,6 +124,8 @@ class TreeMapper(Node):
         self.cluster_gap = float(self.get_parameter("cluster_gap").value)
         self.tree_max_extent = float(self.get_parameter("tree_max_extent").value)
         self.min_points = int(self.get_parameter("min_points").value)
+        self.min_circle_radius = float(self.get_parameter("min_circle_radius").value)
+        self.max_circle_radius = float(self.get_parameter("max_circle_radius").value)
         self.isolation_gap = float(self.get_parameter("isolation_gap").value)
         self.tree_radius = float(self.get_parameter("tree_radius").value)
         self.merge_radius = float(self.get_parameter("merge_radius").value)
@@ -173,12 +209,16 @@ class TreeMapper(Node):
             if not (neighbour_free(c[0][0] - 1) and neighbour_free(c[-1][0] + 1)):
                 continue
 
-            mx = sum(xs) / len(xs); my = sum(ys) / len(ys)
-            d = math.hypot(mx, my)
-            if d > 1e-3:                       # push outward by the noodle radius
-                mx += self.tree_radius * mx / d
-                my += self.tree_radius * my / d
-            centres_laser.append((mx, my))
+            # Shape test: a noodle's arc fits a small circle; a flat wall is
+            # (near-)collinear (fit fails) or fits a radius outside the band.
+            # The fitted centre is the cylinder axis -- no surface push-out needed.
+            fit = fit_circle([(q[2], q[3]) for q in c])
+            if fit is None:
+                continue
+            cxf, cyf, r = fit
+            if not (self.min_circle_radius <= r <= self.max_circle_radius):
+                continue
+            centres_laser.append((cxf, cyf))
         if not centres_laser:
             return
 
