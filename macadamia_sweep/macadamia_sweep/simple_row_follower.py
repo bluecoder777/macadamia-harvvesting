@@ -85,21 +85,29 @@ class SimpleRowFollower(Node):
         self.create_subscription(Empty, "/return_home", self.return_home_callback, 10)
 
         # ---- Tree-aware collection of uncollected nuts (before return-home) ----
-        # For each missed nut we exit to a sweep-entry point BEHIND the field's
-        # near end (relative to home) on the nut's sweep line, align to the row
-        # direction, then sweep the aisle past the nut. The sweeper is on the
-        # hug side (start_side) at collect_sweep_offset; the nut is collected
-        # by nut_tracker when it passes that sweeper point.
+        # For each missed nut we drive to a sweep-entry point ON the nut's sweep
+        # line and a little before it, align to the row direction, then sweep
+        # the aisle past the nut. The sweeper is on the hug side (start_side) at
+        # collect_sweep_offset; the nut is collected by nut_tracker when it
+        # passes that sweeper point.
+        #
+        # The approach point is CLAMPED to the region the robot actually swept
+        # (provably free, because it drove there). This stops the run-in being
+        # staged in unexplored space behind/beside the start, where indoor walls
+        # live - the cause of the "drive into the wall, back up, repeat" loop.
         self.declare_parameter("collect_before_home", True)
         self.declare_parameter("nuts_topic", "/nuts/uncollected")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("collect_sweep_offset", 0.40)   # nut on hug side
-        self.declare_parameter("collect_approach_back", 1.00)  # start sweep this far behind nut
+        self.declare_parameter("collect_approach_back", 1.00)  # start sweep this far before nut
         self.declare_parameter("collect_sweep_through", 0.60)  # drive this far past the nut
-        self.declare_parameter("collect_field_margin", 0.50)   # entry behind home by this much
         self.declare_parameter("collect_arrive_tol", 0.15)
         self.declare_parameter("collect_visit_timeout", 45.0)
+        # Stuck-escape: abandon a nut after this many avoidance trips, and give
+        # up on collection entirely after this many nuts skipped back-to-back.
+        self.declare_parameter("collect_max_avoid", 3)
+        self.declare_parameter("collect_max_consec_skips", 3)
         self.collect_before_home = bool(self.get_parameter("collect_before_home").value)
         self.nuts_topic = self.get_parameter("nuts_topic").value
         self.map_frame = self.get_parameter("map_frame").value
@@ -107,15 +115,46 @@ class SimpleRowFollower(Node):
         self.collect_sweep_offset = float(self.get_parameter("collect_sweep_offset").value)
         self.collect_approach_back = float(self.get_parameter("collect_approach_back").value)
         self.collect_sweep_through = float(self.get_parameter("collect_sweep_through").value)
-        self.collect_field_margin = float(self.get_parameter("collect_field_margin").value)
         self.collect_arrive_tol = float(self.get_parameter("collect_arrive_tol").value)
         self.collect_visit_timeout = float(self.get_parameter("collect_visit_timeout").value)
+        self.collect_max_avoid = int(self.get_parameter("collect_max_avoid").value)
+        self.collect_max_consec_skips = int(self.get_parameter("collect_max_consec_skips").value)
+        # Inter-aisle moves follow the recorded swept polyline (provably clear)
+        # instead of a straight line that could cut across a tree row.
+        self.declare_parameter("path_sample_spacing", 0.15)  # record a point every Xm
+        self.declare_parameter("path_max_points", 4000)
+        self.declare_parameter("path_wp_tol", 0.20)          # progress-snap window
+        self.declare_parameter("path_lookahead", 1)          # carrot this many samples ahead
+        self.path_sample_spacing = float(self.get_parameter("path_sample_spacing").value)
+        self.path_max_points = int(self.get_parameter("path_max_points").value)
+        self.path_wp_tol = float(self.get_parameter("path_wp_tol").value)
+        self.path_lookahead = int(self.get_parameter("path_lookahead").value)
 
         self.uncollected_map: List[Tuple[float, float]] = []   # nut positions (map frame)
         self._collect_skip = set()                             # unreachable nuts to ignore
         self._collect_target: Optional[Tuple[float, float]] = None
         self._collect_phase = "EXIT"
         self._collect_deadline: Optional[float] = None
+        self._collect_avoid_count = 0                          # avoid trips for this nut
+        self._collect_consec_skips = 0                         # nuts skipped back-to-back
+        self._path_idx: Optional[int] = None                  # progress along the route
+        self._path_goal: Optional[int] = None                 # route endpoint index
+
+        # Bounding box of the swept region, in ROW-FRAME coords (along/across the
+        # row). Updated live while sweeping; used to clamp the approach point.
+        self._swept_long_min: Optional[float] = None
+        self._swept_long_max: Optional[float] = None
+        self._swept_lat_min: Optional[float] = None
+        self._swept_lat_max: Optional[float] = None
+        # The actual driven polyline (odom), recorded while sweeping. This is the
+        # known-free corridor used to route inter-aisle collection moves.
+        self._swept_path: List[Tuple[float, float]] = []
+        # States in which the robot is actively sweeping the field (so its pose
+        # marks free ground). Excludes COLLECT_NUTS/RETURN_HOME/AVOID/idle.
+        self._SWEEP_STATES = (
+            "FOLLOW_OUT", "CLEAR_END", "ARC_TURN", "ALIGN",
+            "FOLLOW_BACK", "CLEAR_NEXT", "TURN_NEXT",
+        )
 
         latched = QoSProfile(depth=1)
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -379,6 +418,10 @@ class SimpleRowFollower(Node):
         self.arc_start_yaw = None
         self.arc_last_yaw = None
         self.arc_accumulated_yaw = 0.0
+        # Fresh run: discard the previous sweep's free-space record.
+        self._swept_path = []
+        self._swept_long_min = self._swept_long_max = None
+        self._swept_lat_min = self._swept_lat_max = None
 
         # Save the starting pose for RETURN_HOME. If odom is not ready yet,
         # control_loop will lazily fill this before the robot has moved far.
@@ -1084,9 +1127,11 @@ class SimpleRowFollower(Node):
             )
             return
 
-        # During RETURN_HOME, choose the side with more free space.
+        # When not row-following (returning home or collecting nuts), there is
+        # no row to turn away from - choose the side with more free space so the
+        # robot uses open ground instead of repeatedly turning into a wall.
         # During row-following, turn away from the current row side.
-        if self.avoid_previous_state == "RETURN_HOME":
+        if self.avoid_previous_state in ("RETURN_HOME", "COLLECT_NUTS"):
             left_clear = self.get_sector_distance(25, 90)
             right_clear = self.get_sector_distance(-90, -25)
             turn_dir = +1.0 if left_clear > right_clear else -1.0
@@ -1152,6 +1197,10 @@ class SimpleRowFollower(Node):
             self._collect_target = None
             self._collect_phase = "EXIT"
             self._collect_deadline = None
+            self._collect_avoid_count = 0
+            self._collect_consec_skips = 0
+            self._path_idx = None
+            self._path_goal = None
             self.set_state(
                 "COLLECT_NUTS",
                 reason + f" Collecting {len(self.uncollected_map)} uncollected nut(s) "
@@ -1355,24 +1404,118 @@ class SimpleRowFollower(Node):
             sw = (math.sin(th), -math.cos(th))   # right of d
         return d, sw
 
+    def _update_swept_bounds(self):
+        """Grow the swept-region box (row-frame) and append to the driven
+        polyline. Both describe known-free ground for collection routing."""
+        units = self._row_units()
+        if units is None or self.odom_x is None:
+            return
+        (dx, dy), (sx, sy) = units
+        lon = self.odom_x * dx + self.odom_y * dy
+        lat = self.odom_x * sx + self.odom_y * sy
+        if self._swept_long_min is None:
+            self._swept_long_min = self._swept_long_max = lon
+            self._swept_lat_min = self._swept_lat_max = lat
+        else:
+            self._swept_long_min = min(self._swept_long_min, lon)
+            self._swept_long_max = max(self._swept_long_max, lon)
+            self._swept_lat_min = min(self._swept_lat_min, lat)
+            self._swept_lat_max = max(self._swept_lat_max, lat)
+        # Decimate: only record when we have moved a sample's worth.
+        if not self._swept_path:
+            self._swept_path.append((self.odom_x, self.odom_y))
+        else:
+            lx, ly = self._swept_path[-1]
+            if math.hypot(self.odom_x - lx, self.odom_y - ly) >= self.path_sample_spacing:
+                self._swept_path.append((self.odom_x, self.odom_y))
+                if len(self._swept_path) > self.path_max_points:
+                    self._swept_path.pop(0)
+
+    def _nearest_path_index(self, x: float, y: float) -> int:
+        """Index of the swept-path point closest to (x, y)."""
+        best_i, best_d = 0, float("inf")
+        for i, (px, py) in enumerate(self._swept_path):
+            d = (px - x) * (px - x) + (py - y) * (py - y)
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_i
+
+    def _drive_to_via_path(self, ex: float, ey: float) -> bool:
+        """Drive to (ex,ey) by following the recorded swept polyline, so the
+        move never cuts across a tree row. Falls back to a straight drive if no
+        path is recorded. Returns True when the final point is reached."""
+        path = self._swept_path
+        if len(path) < 2:
+            return self._drive_to(ex, ey, self.collect_arrive_tol)
+        if self._path_goal is None:
+            self._path_goal = self._nearest_path_index(ex, ey)
+            self._path_idx = self._nearest_path_index(self.odom_x, self.odom_y)
+        i_goal = self._path_goal
+        if self._path_idx == i_goal:
+            # On the goal aisle now; final short hop to the precise entry is
+            # collinear with the row, so it crosses nothing.
+            return self._drive_to(ex, ey, self.collect_arrive_tol)
+        step = 1 if i_goal > self._path_idx else -1
+        ox, oy = self.odom_x, self.odom_y
+        # Snap progress to the nearest UPCOMING path point (monotonic toward the
+        # goal). Robust to corner-cutting: we track the closest point rather than
+        # requiring the robot to pass exactly through each waypoint.
+        nearest_i = self._path_idx
+        nearest_d = math.hypot(path[nearest_i][0] - ox, path[nearest_i][1] - oy)
+        probe = self._path_idx
+        while probe != i_goal:
+            probe += step
+            d = math.hypot(path[probe][0] - ox, path[probe][1] - oy)
+            if d < nearest_d:
+                nearest_d, nearest_i = d, probe
+            elif d > nearest_d + self.path_wp_tol:
+                break    # we are clearly past the nearest point; stop scanning
+        self._path_idx = nearest_i
+        if self._path_idx == i_goal:
+            return self._drive_to(ex, ey, self.collect_arrive_tol)
+        # Steer toward a carrot a small number of samples ahead, clamped to the
+        # goal. tol=0 so the low-level driver never stops on a carrot (smooth,
+        # no stutter); the carrot is close enough that arc corner-cut is tiny.
+        carrot = self._path_idx
+        for _ in range(max(1, self.path_lookahead)):
+            if carrot == i_goal:
+                break
+            carrot += step
+        self._drive_to(path[carrot][0], path[carrot][1], 0.0)
+        return False
+
     def _sweep_entry(self, nox, noy):
         """Entry point (odom) for sweeping nut at (nox,noy): on the nut's sweep
-        line (offset so the nut ends up sweep_offset on the hug side), pulled
-        back along the row to BEHIND the field's near end (home), so the run-in
-        approaches from outside instead of cutting across rows."""
+        line (so the nut ends up sweep_offset on the hug side), a little before
+        the nut along the row. CLAMPED to the swept box so the run-in is always
+        staged on ground the robot already drove - never out in the unexplored,
+        possibly walled, space behind/beside the start."""
         units = self._row_units()
-        if units is None or self.home_x is None:
+        if units is None:
             return None
         (dx, dy), (sx, sy) = units
-        # Robot sweep-line point: nut minus the sweeper offset.
+        # Robot sweep-line point L: nut minus the sweeper offset.
         lx = nox - self.collect_sweep_offset * sx
         ly = noy - self.collect_sweep_offset * sy
         l_long = lx * dx + ly * dy
-        home_long = self.home_x * dx + self.home_y * dy
-        target_long = min(l_long - self.collect_approach_back,
-                          home_long - self.collect_field_margin)
-        back = target_long - l_long      # <= -approach_back, moves E behind the field
-        return (lx + back * dx, ly + back * dy)
+        l_lat = lx * sx + ly * sy
+        # Stage the approach a bit before the nut, but never before the swept
+        # region's near end (that is where indoor walls are). max() also keeps
+        # it at/behind the nut's own longitudinal, so the forward sweep passes
+        # the nut, except for the degenerate case of a nut behind the near end.
+        target_long = l_long - self.collect_approach_back
+        if self._swept_long_min is not None:
+            target_long = max(target_long, self._swept_long_min)
+            # Keep the lateral inside the swept columns too.
+            l_lat = max(self._swept_lat_min, min(self._swept_lat_max, l_lat))
+        elif self.home_x is not None:
+            home_long = self.home_x * dx + self.home_y * dy
+            target_long = max(target_long, home_long)         # fallback: not behind home
+        # Reconstruct the odom point from (target_long, l_lat). d and the lateral
+        # unit are orthonormal, so x = long*dx + lat*sx, y = long*dy + lat*sy.
+        ex = target_long * dx + l_lat * sx
+        ey = target_long * dy + l_lat * sy
+        return (ex, ey)
 
     def _drive_to(self, tx: float, ty: float, tol: float) -> bool:
         """Go-to-point with the RETURN_HOME control style + AVOID_FRONT safety.
@@ -1385,6 +1528,7 @@ class SimpleRowFollower(Node):
             self.stop_robot()
             return False
         if front < self.avoid_front_distance:
+            self._collect_avoid_count += 1
             self.enter_avoid_front("COLLECT_NUTS", f"front={front:.2f}m during collect")
             return False
         dx = tx - self.odom_x
@@ -1409,6 +1553,7 @@ class SimpleRowFollower(Node):
             self.stop_robot()
             return
         if front < self.avoid_front_distance:
+            self._collect_avoid_count += 1
             self.enter_avoid_front("COLLECT_NUTS", f"front={front:.2f}m during sweep")
             return
         he = self.normalize_angle(heading - self.odom_yaw)
@@ -1438,6 +1583,12 @@ class SimpleRowFollower(Node):
             valid = key not in self._collect_skip and any(
                 (round(mx, 2), round(my, 2)) == key for (mx, my) in self.uncollected_map)
         if not valid:
+            # If the previous target left the list WITHOUT us skipping it, it was
+            # collected - real progress, so reset the back-to-back skip counter.
+            if self._collect_target is not None:
+                pkey = (round(self._collect_target[0], 2), round(self._collect_target[1], 2))
+                if pkey not in self._collect_skip:
+                    self._collect_consec_skips = 0
             targets = self._uncollected_targets(tf)
             if not targets:
                 self._go_home("All reachable nuts collected.")
@@ -1447,16 +1598,20 @@ class SimpleRowFollower(Node):
             self._collect_target = targets[0][0]
             self._collect_phase = "EXIT"
             self._collect_deadline = now + self.collect_visit_timeout
+            self._collect_avoid_count = 0
+            self._path_idx = None            # recompute route for the new target
+            self._path_goal = None
+
+        # Stuck-escape: a blocked nut keeps tripping AVOID_FRONT and getting
+        # nowhere. Abandon it after a few trips instead of ramming for the whole
+        # timeout - then give up on collection if several go this way in a row.
+        if self._collect_avoid_count > self.collect_max_avoid:
+            self._skip_current_nut("blocked (avoidance limit)")
+            return
 
         # Give up on a nut we can't service in time.
         if self._collect_deadline is not None and now > self._collect_deadline:
-            self._collect_skip.add((round(self._collect_target[0], 2),
-                                    round(self._collect_target[1], 2)))
-            self.get_logger().warn(
-                f"COLLECT_NUTS: skipping nut "
-                f"({self._collect_target[0]:+.2f},{self._collect_target[1]:+.2f})"
-            )
-            self._collect_target = None
+            self._skip_current_nut("visit timeout")
             return
 
         nox, noy = self._apply_tf(self._collect_target[0], self._collect_target[1], tf)
@@ -1467,13 +1622,15 @@ class SimpleRowFollower(Node):
             if entry is None:
                 self._collect_target = None
                 return
-            if self._drive_to(entry[0], entry[1], self.collect_arrive_tol):
+            if self._drive_to_via_path(entry[0], entry[1]):
                 self._collect_phase = "ALIGN"
                 self._collect_deadline = now + self.collect_visit_timeout
+                self._collect_avoid_count = 0    # fresh budget per phase
             else:
                 self.publish_status(
                     f"COLLECT EXIT -> ({entry[0]:+.2f},{entry[1]:+.2f}) | "
-                    f"nut=({nox:+.2f},{noy:+.2f})"
+                    f"nut=({nox:+.2f},{noy:+.2f}) | "
+                    f"route {self._path_idx}->{self._path_goal}"
                 )
             return
 
@@ -1483,6 +1640,7 @@ class SimpleRowFollower(Node):
                 self.stop_robot()
                 self._collect_phase = "SWEEP"
                 self._collect_deadline = now + self.collect_visit_timeout
+                self._collect_avoid_count = 0    # fresh budget per phase
             else:
                 mag = min(self.align_max_angular,
                           max(self.min_align_angular, self.k_align * abs(err)))
@@ -1498,12 +1656,7 @@ class SimpleRowFollower(Node):
             # passes it; that flips `valid` False next tick and we pick the
             # next one. This is the fallback if we drive past without a pickup.
             if robot_long >= nut_long + self.collect_sweep_through:
-                self._collect_skip.add((round(self._collect_target[0], 2),
-                                        round(self._collect_target[1], 2)))
-                self.get_logger().warn(
-                    "COLLECT_NUTS: swept past without pickup; skipping.")
-                self._collect_target = None
-                self.stop_robot()
+                self._skip_current_nut("swept past without pickup")
                 return
             self._sweep_forward(self.outbound_yaw)
             self.publish_status(
@@ -1511,6 +1664,26 @@ class SimpleRowFollower(Node):
                 f"{(nut_long - robot_long):+.2f}m to abeam"
             )
             return
+
+    def _skip_current_nut(self, reason: str):
+        """Abandon the current collection target; give up entirely if too many
+        nuts in a row turn out to be unreachable."""
+        self.stop_robot()
+        if self._collect_target is not None:
+            self._collect_skip.add((round(self._collect_target[0], 2),
+                                    round(self._collect_target[1], 2)))
+            self.get_logger().warn(
+                f"COLLECT_NUTS: skipping nut "
+                f"({self._collect_target[0]:+.2f},{self._collect_target[1]:+.2f}) "
+                f"- {reason}."
+            )
+        self._collect_target = None
+        self._collect_consec_skips += 1
+        if self._collect_consec_skips >= self.collect_max_consec_skips:
+            self._go_home(
+                f"COLLECT_NUTS: {self._collect_consec_skips} nuts unreachable "
+                f"in a row; giving up on collection."
+            )
 
     # -----------------------------
     # State machine
@@ -1544,6 +1717,11 @@ class SimpleRowFollower(Node):
                 f"Lazy home saved: x={self.home_x:+.2f}, y={self.home_y:+.2f}, "
                 f"yaw={math.degrees(self.home_yaw or 0.0):+.1f}deg"
             )
+
+        # Record where the robot has driven during the sweep - that swept box is
+        # known-free ground and bounds where collection may stage its run-in.
+        if self.state in self._SWEEP_STATES:
+            self._update_swept_bounds()
 
         if self.state == "FOLLOW_OUT":
             self.follow_side(self.current_side)
