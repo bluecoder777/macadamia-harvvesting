@@ -212,6 +212,8 @@ class SimpleRowFollower(Node):
         self.arc_start_yaw: Optional[float] = None
         self.arc_last_yaw: Optional[float] = None
         self.arc_accumulated_yaw = 0.0
+        self.arc_center_x: Optional[float] = None   # fixed U-turn centre (odom)
+        self.arc_center_y: Optional[float] = None
 
         # ---------------------------------------------------------------
         # Heading anchor.
@@ -307,6 +309,12 @@ class SimpleRowFollower(Node):
         self.arc_linear_speed = 0.06
         self.arc_max_yaw = math.radians(220.0)
         self.arc_distance_gain = 0.6
+        # Hold the U-turn radius closed-loop on a FIXED odom centre (on the row
+        # line, set at arc start) so the open-loop arc can't drift wide when the
+        # base drives faster than commanded - that drift was leaving the return
+        # sweep starting too far from the row / too close to the next one.
+        self.declare_parameter("arc_radius_gain", 1.2)
+        self.arc_radius_gain = float(self.get_parameter("arc_radius_gain").value)
 
         nominal_omega = self.arc_linear_speed / self.arc_radius
         self.arc_max_duration = self.arc_max_yaw / nominal_omega + 5.0
@@ -900,6 +908,20 @@ class SimpleRowFollower(Node):
             if self.arc_last_yaw is None:
                 self.arc_start_yaw = self.odom_yaw
                 self.arc_last_yaw = self.odom_yaw
+                # Fix the turn centre ON the row line: the robot is one
+                # arc_radius from the row on the hug side, so step arc_radius
+                # toward that side from here. Right of heading th = (sin,-cos);
+                # left = (-sin,cos).
+                if self.odom_x is not None:
+                    th = self.odom_yaw
+                    if self.current_side == "right":
+                        tr_x, tr_y = math.sin(th), -math.cos(th)
+                    else:
+                        tr_x, tr_y = -math.sin(th), math.cos(th)
+                    self.arc_center_x = self.odom_x + self.arc_radius * tr_x
+                    self.arc_center_y = self.odom_y + self.arc_radius * tr_y
+                else:
+                    self.arc_center_x = None    # open-loop until odom is back
             else:
                 # SIGNED accumulation in the commanded turn direction:
                 # abs() would count yaw NOISE as progress (a "180 deg" arc
@@ -914,16 +936,20 @@ class SimpleRowFollower(Node):
         v = self.arc_linear_speed
         base_omega = v / self.arc_radius
 
-        # PURE ODOMETRY ARC - no lidar correction.
-        # The old lidar distance-correction measured "distance to the row"
-        # mid-arc, but halfway around the turn the robot straddles the row
-        # line: its own row's trees are excluded (|perp| ~ 0) and the
-        # NEIGHBOURING row becomes the nearest fit, so the correction
-        # tightened the turn into the last tree (offline sim showed a
-        # near-collision, 3 cm clearance). A constant-omega arc has clean,
-        # provable geometry: with clear_end=0.15 and r=0.40 the robot
-        # orbits the last tree with ~0.25 m centre clearance.
+        # ODOMETRY arc, radius held closed-loop on the FIXED centre set above -
+        # NOT on lidar (mid-arc the robot straddles the row line and a lidar fit
+        # grabs the neighbouring row, tightening into the last tree). Using a
+        # fixed odom centre keeps the clean geometry AND stops the open-loop
+        # radius drifting wide when the base overshoots the commanded speed.
         omega = base_omega
+        dist_c = self.arc_radius
+        if self.arc_center_x is not None and self.odom_x is not None:
+            dist_c = math.hypot(self.odom_x - self.arc_center_x,
+                                self.odom_y - self.arc_center_y)
+            # Too far from centre -> arc too wide -> tighten (more omega);
+            # too close -> loosen. Normalised by radius, clamped to sane range.
+            scale = 1.0 + self.arc_radius_gain * (dist_c - self.arc_radius) / self.arc_radius
+            omega = base_omega * max(0.4, min(2.5, scale))
 
         # PRIMARY exit: rotated 180 deg from arc start.
         arc_target_yaw = math.pi
@@ -953,7 +979,7 @@ class SimpleRowFollower(Node):
 
         self.publish_cmd(v, sign * omega)
         self.publish_status(
-            f"ARC | yaw +{yaw_deg:.0f}/180deg | r={self.arc_radius:.2f}m | "
+            f"ARC | yaw +{yaw_deg:.0f}/180deg | r_act={dist_c:.2f}/{self.arc_radius:.2f}m | "
             f"front={front:.2f}m"
         )
 
@@ -1852,7 +1878,13 @@ class SimpleRowFollower(Node):
             if opp_visible and abs(opp_fit[1]) <= self.next_row_max_dist:
                 self.next_row_hits += 1
 
-            if self.should_end_pass():
+            # End the return pass the moment the last tree of THIS row goes
+            # abeam/behind - same geometric cut FOLLOW_OUT uses. Without it,
+            # FOLLOW_BACK relied only on the 2 s "row lost" timeout, but the wide
+            # side cone (-170..+20 deg) keeps already-passed trees "visible", so
+            # the timer never fired and the robot overshot far past the row end.
+            abeam = self.last_tree_abeam_or_behind(self.current_side)
+            if abeam or self.should_end_pass():
                 self.rows_completed += 1
                 next_row_seen = self.next_row_hits >= self.next_row_min_hits
 
