@@ -180,6 +180,48 @@ for _ in range(4000):
 check("fallback drives straight when no path recorded", arrived3,
       f"end=({f3.odom_x:.2f},{f3.odom_y:.2f})")
 
+# ===========================================================================
+print("=== safety-point geometry (staging + dip) ===")
+# Rows along +x (outbound_yaw=0); hug side = right = -y. A nut on the hug side
+# at y=-0.40 corresponds to a robot aisle at y=0. Swept long [0,5], lat [-1,0.5].
+def make_safety_follower():
+    f = SRF.SimpleRowFollower.__new__(SRF.SimpleRowFollower)
+    f.outbound_yaw = 0.0
+    f.start_side = "right"
+    f.collect_sweep_offset = 0.40
+    f.collect_sweep_through = 0.60
+    f._swept_long_min, f._swept_long_max = 0.0, 5.0
+    f._swept_lat_min, f._swept_lat_max = -1.0, 0.5
+    return f
+
+fs = make_safety_follower()
+# Nut near the FAR end (x=3 of 0..5) -> approach from the far headland.
+s_far = fs._safety_for_nut(3.0, -0.40)
+sx, sy, dipx, dipy, end_long, l_lat = s_far
+check("aisle lateral recovered (nut 0.40 off the aisle)", abs(l_lat - 0.0) < 1e-6,
+      f"l_lat={l_lat:.3f}")
+check("far-end nut staged at the FAR headland (x=5)", abs(sx - 5.0) < 1e-6,
+      f"safety=({sx:.2f},{sy:.2f})")
+check("safety point sits IN the aisle (y=0)", abs(sy - 0.0) < 1e-6, f"sy={sy:.3f}")
+check("dip overshoots the nut toward the entry end (x=2.4)", abs(dipx - 2.4) < 1e-6,
+      f"dipx={dipx:.3f}")
+check("dip stays in the aisle (y=0), never toward the trees", abs(dipy - 0.0) < 1e-6,
+      f"dipy={dipy:.3f}")
+
+# Nut near the NEAR end (x=1) -> approach from the near headland (x=0).
+s_near = fs._safety_for_nut(1.0, -0.40)
+check("near-end nut staged at the NEAR headland (x=0)", abs(s_near[0] - 0.0) < 1e-6,
+      f"safety_x={s_near[0]:.2f}")
+check("near-end dip overshoots away from entry (x=1.6)", abs(s_near[2] - 1.6) < 1e-6,
+      f"dipx={s_near[2]:.3f}")
+
+# A nut whose aisle falls outside the swept columns is clamped back in. The
+# lateral is in the hug-unit basis (hug = -y here), so a nut deep in -y maps to
+# a LARGE positive lat (1.6) and clamps to the column max (0.5), not the min.
+s_clip = fs._safety_for_nut(3.0, -2.0)
+check("aisle lateral clamped into the swept columns", abs(s_clip[5] - 0.5) < 1e-6,
+      f"l_lat={s_clip[5]:.3f}")
+
 print()
 print("=" * 60)
 print(f"COLLECT ROUTING TEST: {PASS}/{PASS + FAIL} checks passed")
