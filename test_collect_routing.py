@@ -28,6 +28,9 @@ class _Node:
         pass
 node_mod.Node = _Node
 
+_mod("rclpy.executors").ExternalShutdownException = type(
+    "ExternalShutdownException", (Exception,), {})
+
 qos_mod = _mod("rclpy.qos")
 qos_mod.QoSProfile = type("QoSProfile", (), {"__init__": lambda self, *a, **k: None})
 qos_mod.DurabilityPolicy = types.SimpleNamespace(TRANSIENT_LOCAL=1, VOLATILE=0)

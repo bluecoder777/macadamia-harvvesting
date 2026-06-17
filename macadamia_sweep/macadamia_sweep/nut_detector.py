@@ -55,6 +55,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.time import Time
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
+from rclpy.executors import ExternalShutdownException
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseArray, Pose
@@ -774,11 +775,12 @@ def main(args=None):
     node = NutDetector()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

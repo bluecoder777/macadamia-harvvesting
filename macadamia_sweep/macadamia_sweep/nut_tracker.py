@@ -42,6 +42,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
+from rclpy.executors import ExternalShutdownException
 
 from geometry_msgs.msg import PoseArray, Pose
 from std_msgs.msg import String
@@ -369,11 +370,12 @@ def main(args=None):
     node = NutTracker()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        node.destroy_node()        # saves the CSV
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

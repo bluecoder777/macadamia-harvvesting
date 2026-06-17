@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 
 from geometry_msgs.msg import TwistStamped, PoseArray
 from nav_msgs.msg import Odometry
@@ -1742,6 +1743,12 @@ class SimpleRowFollower(Node):
             cur_long = self.odom_x * dx + self.odom_y * dy
             direction = 1.0 if nut_long >= cur_long else -1.0
             dip_long = nut_long + direction * self.collect_sweep_through
+            # Never dip beyond the explored field: a nut placed/seen past the
+            # swept ends (e.g. a stray detection outside the area) must not drag
+            # the robot out into unmapped space. Clamp to the swept extent - if
+            # the nut is really out there, the dip stops at the edge and the nut
+            # is skipped ("dipped past without pickup") instead of chased.
+            dip_long = max(self._swept_long_min, min(self._swept_long_max, dip_long))
             tx = dip_long * dx + l_lat * sxu
             ty = dip_long * dy + l_lat * syu
             nxt = None
@@ -1952,12 +1959,14 @@ def main(args=None):
     node = SimpleRowFollower()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.stop_robot()
+        if rclpy.ok():
+            node.stop_robot()       # only publish while the context is alive
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

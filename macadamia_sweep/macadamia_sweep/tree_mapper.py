@@ -32,6 +32,7 @@ from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
+from rclpy.executors import ExternalShutdownException
 
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseArray, Pose
@@ -343,11 +344,12 @@ def main(args=None):
     node = TreeMapper()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

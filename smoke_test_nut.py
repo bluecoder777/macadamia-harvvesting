@@ -45,6 +45,9 @@ class _Node:
         pass
 node_mod.Node = _Node
 
+_mod("rclpy.executors").ExternalShutdownException = type(
+    "ExternalShutdownException", (Exception,), {})
+
 dur_mod = _mod("rclpy.duration")
 class _Duration:
     def __init__(self, *a, **k):
