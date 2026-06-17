@@ -9,7 +9,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import TwistStamped, PoseArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Empty, String, Bool
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from rclpy.time import Time
 import tf2_ros
@@ -77,6 +77,17 @@ class SimpleRowFollower(Node):
 
         self.cmd_pub = self.create_publisher(TwistStamped, "/cmd_vel_nav", 10)
         self.status_pub = self.create_publisher(String, "/snc_status", 10)
+        # Tells the perception nodes to run (True) or hold (False). Perception is
+        # on during the sweep and off from missed-nut collection onward (collect +
+        # return), so the nut world model AND the tree map are frozen while the
+        # robot manoeuvres to pick the nuts up. Latched.
+        _enable_qos = QoSProfile(depth=1)
+        _enable_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        _enable_qos.history = HistoryPolicy.KEEP_LAST
+        self.detect_enable_pub = self.create_publisher(
+            Bool, "/nuts/detect_enable", _enable_qos)
+        self.tree_enable_pub = self.create_publisher(
+            Bool, "/trees/enable", _enable_qos)
 
         self.create_subscription(LaserScan, "/scan", self.scan_callback, 10)
         self.create_subscription(Odometry, "/odometry/filtered", self.odom_callback, 20)
@@ -137,6 +148,7 @@ class SimpleRowFollower(Node):
         self._collect_deadline: Optional[float] = None
         self._collect_avoid_count = 0                          # avoid trips for this nut
         self._collect_consec_skips = 0                         # nuts skipped back-to-back
+        self._collect_best = float("inf")                      # best remaining-route metric
         self._path_idx: Optional[int] = None                  # progress along the route
         self._path_goal: Optional[int] = None                 # route endpoint index
 
@@ -418,6 +430,7 @@ class SimpleRowFollower(Node):
         self.arc_start_yaw = None
         self.arc_last_yaw = None
         self.arc_accumulated_yaw = 0.0
+        self.set_perception(True)           # detect nuts + map trees during the sweep
         # Fresh run: discard the previous sweep's free-space record.
         self._swept_path = []
         self._swept_long_min = self._swept_long_max = None
@@ -491,6 +504,7 @@ class SimpleRowFollower(Node):
         self.arc_last_yaw = None
         self.arc_accumulated_yaw = 0.0
         self.stop_robot()
+        self.set_perception(False)          # mission winding down: freeze nut + tree maps
         self._home_phase = "OUT"
         self.set_state(
             "RETURN_HOME",
@@ -507,6 +521,14 @@ class SimpleRowFollower(Node):
         m = String()
         m.data = text
         self.status_pub.publish(m)
+
+    def set_perception(self, enabled: bool):
+        """Enable/pause BOTH perception nodes together: nut_detector (latched
+        /nuts/detect_enable) and tree_mapper (latched /trees/enable)."""
+        m = Bool()
+        m.data = bool(enabled)
+        self.detect_enable_pub.publish(m)
+        self.tree_enable_pub.publish(m)
 
     def elapsed_in_state(self) -> float:
         return (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
@@ -1192,6 +1214,9 @@ class SimpleRowFollower(Node):
     def finish_or_return_home(self, reason: str):
         """Collect any uncollected nuts first (if enabled), then return home."""
         self.stop_robot()
+        # Sweep is over: freeze the nut world model AND the tree map for the rest
+        # of the mission (collection + return home) by pausing perception.
+        self.set_perception(False)
         if self.collect_before_home and self.uncollected_map:
             self._collect_skip = set()
             self._collect_target = None
@@ -1599,6 +1624,7 @@ class SimpleRowFollower(Node):
             self._collect_phase = "EXIT"
             self._collect_deadline = now + self.collect_visit_timeout
             self._collect_avoid_count = 0
+            self._collect_best = float("inf")   # reset route-progress tracking
             self._path_idx = None            # recompute route for the new target
             self._path_goal = None
 
@@ -1626,11 +1652,26 @@ class SimpleRowFollower(Node):
                 self._collect_phase = "ALIGN"
                 self._collect_deadline = now + self.collect_visit_timeout
                 self._collect_avoid_count = 0    # fresh budget per phase
+                self._collect_best = float("inf")
             else:
+                # Remaining work: samples left on the corridor while routing, or
+                # metres to the entry on the final hop. Whenever it improves we
+                # are progressing, so push the deadline out - a long but advancing
+                # route (e.g. a nut that needs the full loop back) must NOT be
+                # given up on; only a genuine stall trips the timeout.
+                if (self._path_goal is not None and self._path_idx is not None
+                        and self._path_idx != self._path_goal):
+                    remaining = float(abs(self._path_goal - self._path_idx))
+                else:
+                    remaining = math.hypot(entry[0] - self.odom_x,
+                                           entry[1] - self.odom_y)
+                if remaining < self._collect_best - 1e-3:
+                    self._collect_best = remaining
+                    self._collect_deadline = now + self.collect_visit_timeout
                 self.publish_status(
                     f"COLLECT EXIT -> ({entry[0]:+.2f},{entry[1]:+.2f}) | "
                     f"nut=({nox:+.2f},{noy:+.2f}) | "
-                    f"route {self._path_idx}->{self._path_goal}"
+                    f"route {self._path_idx}->{self._path_goal} rem={remaining:.0f}"
                 )
             return
 

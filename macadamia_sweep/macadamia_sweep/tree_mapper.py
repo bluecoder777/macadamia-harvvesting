@@ -36,6 +36,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseArray, Pose
 from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Bool
 
 import tf2_ros
 
@@ -143,6 +144,15 @@ class TreeMapper(Node):
         self.tree_pub = self.create_publisher(PoseArray, "/trees", latched)
         self.marker_pub = self.create_publisher(MarkerArray, "/trees/markers", 10)
 
+        # Enable gate: the follower pauses tree mapping once the sweep finishes
+        # (during missed-nut collection + return home) so the tree map is frozen
+        # and can't drift/grow phantoms while the robot manoeuvres. Latched so a
+        # late-joining mapper still picks up the last command.
+        self._mapping_enabled = True
+        self.create_subscription(
+            Bool, "/trees/enable", self.enable_cb, latched
+        )
+
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, 10)
         self.create_timer(0.5, self.publish_markers)
 
@@ -155,7 +165,16 @@ class TreeMapper(Node):
     # Scan -> tree detections
     # -----------------------------
 
+    def enable_cb(self, msg: Bool):
+        if self._mapping_enabled != msg.data:
+            self.get_logger().info(
+                f"Tree mapping {'ENABLED' if msg.data else 'PAUSED'} by /trees/enable."
+            )
+        self._mapping_enabled = bool(msg.data)
+
     def scan_cb(self, msg: LaserScan):
+        if not self._mapping_enabled:
+            return                      # frozen: no new clustering / publishing
         n = len(msg.ranges)
         rmin, rmax = msg.range_min, msg.range_max
 
@@ -279,6 +298,8 @@ class TreeMapper(Node):
         self.tree_pub.publish(pa)
 
     def publish_markers(self):
+        if not self._mapping_enabled:
+            return                      # paused: leave the last markers on screen
         arr = MarkerArray()
         for i, t in enumerate(self.confirmed()):
             noodle = Marker()

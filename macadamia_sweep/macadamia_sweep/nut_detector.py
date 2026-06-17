@@ -54,10 +54,12 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseArray, Pose
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Bool
 
 import tf2_ros
 
@@ -303,6 +305,18 @@ class NutDetector(Node):
                 Odometry, self.odom_topic, self.odom_callback, 20
             )
 
+        # Enable gate: the follower disables detection once the sweep finishes
+        # (during missed-nut collection + return home), so the world model is
+        # frozen and the collection run can't be disturbed by fresh detections.
+        # Latched so a late-joining detector still picks up the last command.
+        self._detect_enabled = True
+        enable_qos = QoSProfile(depth=1)
+        enable_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        enable_qos.history = HistoryPolicy.KEEP_LAST
+        self.create_subscription(
+            Bool, "/nuts/detect_enable", self.detect_enable_callback, enable_qos
+        )
+
         self.frame_count = 0
         self._debug_tint: Optional[np.ndarray] = None
         self._debug_tint_label = ""
@@ -382,6 +396,13 @@ class NutDetector(Node):
             return
         self._depth_m = depth
 
+    def detect_enable_callback(self, msg: Bool):
+        if self._detect_enabled != msg.data:
+            self.get_logger().info(
+                f"Detection {'ENABLED' if msg.data else 'DISABLED'} by /nuts/detect_enable."
+            )
+        self._detect_enabled = bool(msg.data)
+
     def image_callback(self, msg: Image):
         self.frame_count += 1
         if self.frame_count % self.process_every_n != 0:
@@ -392,6 +413,21 @@ class NutDetector(Node):
             self.get_logger().warn(
                 f"Unhandled image encoding '{msg.encoding}'", throttle_duration_sec=5.0
             )
+            return
+
+        # Detection disabled (sweep finished -> collecting / returning home).
+        # Publish empty detections so the tracker's world model just holds.
+        if not self._detect_enabled:
+            empty = PoseArray()
+            empty.header.stamp = msg.header.stamp
+            empty.header.frame_id = self.target_frame
+            self.det_pub.publish(empty)
+            if self.debug_pub is not None:
+                vis = bgr.copy()
+                cv2.putText(
+                    vis, "DETECTION DISABLED (collecting / returning home)",
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                self._publish_image_bgr(vis, msg.header.stamp)
             return
 
         # Suppress detection while turning (blur + fast viewpoint change corrupt

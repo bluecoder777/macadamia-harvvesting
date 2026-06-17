@@ -127,6 +127,7 @@ sys.modules["sensor_msgs.msg"].Image = _Image
 sys.modules["sensor_msgs.msg"].CameraInfo = _CameraInfo
 std = _mod("std_msgs"); _mod("std_msgs.msg")
 sys.modules["std_msgs.msg"].String = _String
+sys.modules["std_msgs.msg"].Bool = type("Bool", (), {"__init__": lambda self: setattr(self, "data", False)})
 vis = _mod("visualization_msgs"); _mod("visualization_msgs.msg")
 sys.modules["visualization_msgs.msg"].Marker = _Marker
 sys.modules["visualization_msgs.msg"].MarkerArray = _MarkerArray
