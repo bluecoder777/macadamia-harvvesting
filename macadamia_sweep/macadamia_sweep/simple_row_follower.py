@@ -220,13 +220,11 @@ class SimpleRowFollower(Node):
         self.arc_start_yaw: Optional[float] = None
         self.arc_last_yaw: Optional[float] = None
         self.arc_accumulated_yaw = 0.0
-        self.arc_center_x: Optional[float] = None   # U-turn centre on the row line
+        # Open-loop constant-omega U-turn (see arc_turn): no centre/radius
+        # estimation, so these stay unused but are kept for state-reset code.
+        self.arc_center_x: Optional[float] = None
         self.arc_center_y: Optional[float] = None
         self._last_row_perp: Optional[float] = None  # last measured dist to the row
-        # World position of the last tree of THIS pass, captured the moment it
-        # goes abeam. The U-turn orbits THIS point so the clearance to the tree
-        # is a constant arc_radius, no matter where the pass actually ended.
-        self.last_tree_world: Optional[Tuple[float, float]] = None
 
         # ---------------------------------------------------------------
         # Heading anchor.
@@ -355,17 +353,10 @@ class SimpleRowFollower(Node):
         self.arc_radius = float(self.get_parameter("arc_radius").value)
         self.arc_linear_speed = 0.06
         self.arc_max_yaw = math.radians(220.0)
-        self.arc_distance_gain = 0.6
-        # Hold the U-turn radius closed-loop around a centre fixed ON THE ROW
-        # LINE (placed by a ONE-TIME lidar fit at arc start - reliable because
-        # the robot is beside the row then, unlike mid-arc when it straddles two
-        # rows). This keeps the orbit at arc_radius from the actual tree line, so
-        # it can't drift wide toward the next row, and - because the centre is on
-        # the real row, not assumed 0.40 m away - it pulls the robot OUT to
-        # arc_radius if it starts a touch close, instead of orbiting into the
-        # tree (the ram the assumed-0.40 version caused on row 2).
-        self.declare_parameter("arc_radius_gain", 1.2)
-        self.arc_radius_gain = float(self.get_parameter("arc_radius_gain").value)
+        # The U-turn is OPEN-LOOP constant-omega (see arc_turn) - no lidar/centre
+        # correction. Closed-loop radius-holding was tried and removed: mid-arc
+        # the robot straddles the row line, so the nearest fit jumps to the next
+        # row and the correction tightened the turn into the last tree.
 
         nominal_omega = self.arc_linear_speed / self.arc_radius
         self.arc_max_duration = self.arc_max_yaw / nominal_omega + 5.0
@@ -970,39 +961,6 @@ class SimpleRowFollower(Node):
             if self.arc_last_yaw is None:
                 self.arc_start_yaw = self.odom_yaw
                 self.arc_last_yaw = self.odom_yaw
-                # ONE-TIME centre placement. PREFER the actual last tree (world
-                # position captured when it went abeam): orbiting the tree itself
-                # keeps a CONSTANT arc_radius around it no matter where the pass
-                # ended. The robot is only ~CLEAR_END past it here, so the centre
-                # is essentially to the side and the 180 deg arc still swings
-                # FORWARD (the closed-loop radius hold trims the small offset).
-                # If no tree was captured (pass ended with none ahead), fall back
-                # to the PERPENDICULAR FOOT on the row line - to the side so the
-                # heading is tangent and the U-turn swings forward and crosses.
-                self.arc_center_x = None
-                if self.last_tree_world is not None:
-                    self.arc_center_x, self.arc_center_y = self.last_tree_world
-                else:
-                    perp_use = None
-                    if self.odom_x is not None:
-                        fit = self.fit_row_line(self.current_side)
-                        if fit is not None:
-                            perp_use = abs(fit[1])
-                            self._last_row_perp = perp_use
-                        elif self._last_row_perp is not None:
-                            # Row not visible right now: fall back to the last
-                            # measured perpendicular distance (it barely changes
-                            # along a pass), so the centre still lands on the row
-                            # line instead of being guessed past the tree.
-                            perp_use = self._last_row_perp
-                    if perp_use is not None:
-                        th = self.odom_yaw
-                        if self.current_side == "right":
-                            tr_x, tr_y = math.sin(th), -math.cos(th)   # right of heading
-                        else:
-                            tr_x, tr_y = -math.sin(th), math.cos(th)   # left of heading
-                        self.arc_center_x = self.odom_x + perp_use * tr_x
-                        self.arc_center_y = self.odom_y + perp_use * tr_y
             else:
                 # SIGNED accumulation in the commanded turn direction:
                 # abs() would count yaw NOISE as progress (a "180 deg" arc
@@ -1017,22 +975,19 @@ class SimpleRowFollower(Node):
         v = self.arc_linear_speed
         base_omega = v / self.arc_radius
 
-        # Hold the orbit at arc_radius around the fixed, on-row-line centre. With
-        # the centre on the real row, "too far from centre" means too wide (more
-        # omega -> tighten) and "too close" means heading into the tree (less
-        # omega -> widen, pulling OUT to arc_radius). Falls back to open-loop
-        # constant omega if the start fit failed (no centre).
+        # PURE OPEN-LOOP CONSTANT-OMEGA ARC - no lidar, no centre, no radius
+        # correction (restored from the "safety line" design, which the turns
+        # were reliable under). Any mid-arc distance correction measures the
+        # "distance to the row" while the robot straddles the row line halfway
+        # round: its own trees fall to |perp|~0 and the NEIGHBOURING row becomes
+        # the nearest fit, so the correction tightened the turn INTO the last
+        # tree. A constant 0.40 m circle has clean, provable geometry - with the
+        # outbound ending ~abeam the last tree and clear_end=0.15 m it orbits
+        # that tree at ~0.25 m clearance, independent of perception.
         omega = base_omega
-        dist_c = self.arc_radius
-        if self.arc_center_x is not None and self.odom_x is not None:
-            dist_c = math.hypot(self.odom_x - self.arc_center_x,
-                                self.odom_y - self.arc_center_y)
-            scale = 1.0 + self.arc_radius_gain * (dist_c - self.arc_radius) / self.arc_radius
-            omega = base_omega * max(0.4, min(2.5, scale))
 
         # PRIMARY exit: rotated 180 deg from arc start.
-        arc_target_yaw = math.pi
-        if self.arc_accumulated_yaw >= arc_target_yaw:
+        if self.arc_accumulated_yaw >= math.pi:
             self.set_state(
                 "ALIGN",
                 f"Arc 180 deg complete at +{yaw_deg:.0f}. Aligning to row."
@@ -1058,7 +1013,7 @@ class SimpleRowFollower(Node):
 
         self.publish_cmd(v, sign * omega)
         self.publish_status(
-            f"ARC | yaw +{yaw_deg:.0f}/180deg | r_act={dist_c:.2f}/{self.arc_radius:.2f}m | "
+            f"ARC | yaw +{yaw_deg:.0f}/180deg | r={self.arc_radius:.2f}m | "
             f"front={front:.2f}m"
         )
 
@@ -2042,17 +1997,6 @@ class SimpleRowFollower(Node):
                                     and self.passed_forward_tree and not tree_ahead)
             if abeam or lost:
                 trigger = "last tree abeam" if abeam else "row lost"
-                # Capture the last tree's WORLD position now (it is ~abeam), so
-                # the U-turn orbits the tree itself at a constant arc_radius.
-                if abeam and _pts and self.odom_x is not None:
-                    ltx, lty = max(_pts, key=lambda p: p[0])  # robot frame
-                    cth, sth = math.cos(self.odom_yaw), math.sin(self.odom_yaw)
-                    self.last_tree_world = (
-                        self.odom_x + ltx * cth - lty * sth,
-                        self.odom_y + ltx * sth + lty * cth,
-                    )
-                else:
-                    self.last_tree_world = None
                 self.get_logger().warn(
                     f"FOLLOW_OUT end: {trigger} | trees_seen={len(_pts)} "
                     f"fwd_tree_x={_fwd:+.2f}m elapsed={self.elapsed_in_state():.1f}s"
