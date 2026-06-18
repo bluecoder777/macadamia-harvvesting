@@ -300,9 +300,14 @@ class SimpleRowFollower(Node):
         self.max_pass_duration = 90.0
         self.row_lost_timeout = 2.0
 
-        # CLEAR_END (0.15 puts the arc centre right at the row end with
-        # ~0.25 m centre clearance to the last tree - see arc note below).
-        self.declare_parameter("clear_end_distance", 0.15)
+        # CLEAR_END: how far to drive PAST the last tree before the U-turn. The
+        # arc centre is placed at the robot's position here, so this is also how
+        # far the orbit centre sits BEYOND the last tree - and the clearance to
+        # that tree is (arc_radius - this). 0.15 m left only ~0.25 m (the body
+        # then clipped the tree). ~0.05 m centres the orbit ON the last tree, so
+        # the robot keeps the full ~0.40 m (= arc_radius) around it. Lower this
+        # for more clearance; raise arc_radius if you also want a wider berth.
+        self.declare_parameter("clear_end_distance", 0.05)
         self.clear_end_distance = float(
             self.get_parameter("clear_end_distance").value
         )
