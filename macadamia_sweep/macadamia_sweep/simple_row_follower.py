@@ -264,9 +264,9 @@ class SimpleRowFollower(Node):
         # LATERAL_ALIGN: after the in-place pivot to a new row, drive the robot
         # out to desired_side_distance from that row BEFORE sweeping it, so every
         # row (not just row 1, which the operator places by hand) starts the
-        # outbound pass - and therefore the U-turn - at the correct 0.40 m. The
-        # pivot leaves it ~0.30 m from the next row (0.70 m spacing - 0.40 m hug);
-        # nothing else re-establishes the distance.
+        # outbound pass at the correct 0.40 m. The pivot leaves it ~0.30 m from
+        # the next row (0.70 m spacing - 0.40 m hug); nothing else re-establishes
+        # the distance.
         self.declare_parameter("lateral_align_tol", 0.05)        # m, |dist-0.40|
         self.declare_parameter("lateral_align_speed", 0.04)      # low: mostly lateral
         self.declare_parameter("lateral_align_max_duration", 12.0)
@@ -1142,10 +1142,9 @@ class SimpleRowFollower(Node):
         self.arc_last_yaw = None
         self.arc_accumulated_yaw = 0.0
         # current_side is UNCHANGED: after the in-place 180 the next row
-        # sits on the same commanded side as the previous one did.
-        # Correct the lateral offset to 0.40 m BEFORE sweeping (the pivot leaves
-        # us ~0.30 m from the new row); then FOLLOW_OUT starts at the right
-        # distance so the U-turn lands on the row line.
+        # sits on the same commanded side as the previous one did. Correct the
+        # lateral offset to 0.40 m before sweeping (the pivot leaves us ~0.30 m
+        # from the new row).
         self.set_state("LATERAL_ALIGN", status + " Correcting lateral offset.")
 
     def lateral_align(self):
@@ -1960,13 +1959,11 @@ class SimpleRowFollower(Node):
             if opp_visible and abs(opp_fit[1]) <= self.next_row_max_dist:
                 self.next_row_hits += 1
 
-            # End the return pass the moment the last tree of THIS row goes
-            # abeam/behind - same geometric cut FOLLOW_OUT uses. Without it,
-            # FOLLOW_BACK relied only on the 2 s "row lost" timeout, but the wide
-            # side cone (-170..+20 deg) keeps already-passed trees "visible", so
-            # the timer never fired and the robot overshot far past the row end.
-            abeam = self.last_tree_abeam_or_behind(self.current_side)
-            if abeam or self.should_end_pass():
+            # End the return pass via should_end_pass only (the original logic).
+            # (A geometric "last tree abeam" cut was tried here to stop an
+            # over-shoot south, but it ended the return EARLY mid-row, which then
+            # started row 2 too far north - worse. Reverted to baseline.)
+            if self.should_end_pass():
                 self.rows_completed += 1
                 next_row_seen = self.next_row_hits >= self.next_row_min_hits
 
