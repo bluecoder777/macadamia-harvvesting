@@ -200,6 +200,13 @@ class SimpleRowFollower(Node):
         self.state_start_time = self.get_clock().now()
         self.last_row_seen_time = self.get_clock().now()
         self.seen_row_this_pass = False
+        # Latch: the "last tree abeam" end-of-pass cut may only fire AFTER the
+        # robot has actually driven up alongside the row (seen a tree clearly
+        # ahead this pass). Without it, a pass that BEGINS with the row already
+        # abeam/behind - e.g. a new row entered from LATERAL_ALIGN, which arms
+        # seen_row_this_pass before FOLLOW_OUT - ends on tick 1 and the robot
+        # never sweeps it (and could ram, having "ended" right next to a tree).
+        self.passed_forward_tree = False
 
         # Side the row is on for the CURRENT pass.
         # The arc U-turn LOOPS AROUND the last tree, crossing the row line.
@@ -281,6 +288,10 @@ class SimpleRowFollower(Node):
         self._strafe_dist = 0.0
         self._strafe_heading = 0.0
         self._strafe_start: Optional[Tuple[float, float]] = None
+        # Cap the sideways crab so one bad lidar fit can't fling the robot far
+        # off the row ("no need to go further away"). The pivot only ever leaves
+        # ~0.10 m to correct (0.70 m spacing - 0.40 m hug), so 0.25 m is plenty.
+        self.lateral_align_max_strafe = 0.25
 
         # -----------------------------
         # Row detection (cluster-then-fit)
@@ -306,6 +317,14 @@ class SimpleRowFollower(Node):
         self.min_pass_duration = 10.0
         self.max_pass_duration = 90.0
         self.row_lost_timeout = 2.0
+        # A tree must be seen at least this far AHEAD (robot-frame +x) before the
+        # "last tree abeam" cut is allowed to end the pass (see passed_forward_tree).
+        self.forward_tree_arm = 0.25
+        # End the RETURN pass by position: when the robot has driven back to this
+        # longitude (projected on the outbound axis, home = 0). Position, not the
+        # flaky row fit, so the return always sweeps the FULL row instead of
+        # quitting the instant the noodles drop out of detection.
+        self.return_end_margin = 0.0
 
         # CLEAR_END: drive this far PAST the last tree before starting the
         # U-turn, so the robot has room to turn in without its front swinging
@@ -466,6 +485,7 @@ class SimpleRowFollower(Node):
         self.state_start_time = self.get_clock().now()
         self.last_row_seen_time = self.get_clock().now()
         self.seen_row_this_pass = False
+        self.passed_forward_tree = False
         self.current_side = self.start_side
         self.clear_start_x = None
         self.clear_start_y = None
@@ -797,8 +817,16 @@ class SimpleRowFollower(Node):
         pts = self.side_cone_points(side)
         if not pts:
             return False
-        ahead_threshold = 0.05
         max_x = max(p[0] for p in pts)
+        # Arm the cut only once a tree has been clearly AHEAD this pass: that is
+        # what "we have driven up alongside the row" looks like. A pass that
+        # starts with every tree already abeam/behind stays un-armed, so it can
+        # never end on tick 1 (the row-2-after-LATERAL_ALIGN instant-end / ram).
+        if max_x > self.forward_tree_arm:
+            self.passed_forward_tree = True
+        if not self.passed_forward_tree:
+            return False
+        ahead_threshold = 0.05
         return max_x <= ahead_threshold
 
     def mark_row_seen_if_visible(self, visible: bool):
@@ -1094,6 +1122,7 @@ class SimpleRowFollower(Node):
     def _enter_follow_back(self, status: str):
         self.last_row_seen_time = self.get_clock().now()
         self.seen_row_this_pass = False
+        self.passed_forward_tree = False
         self.next_row_hits = 0  # fresh count for THIS return pass
         self.set_state("FOLLOW_BACK", status)
 
@@ -1162,6 +1191,7 @@ class SimpleRowFollower(Node):
         """Reset per-row state and start the outbound pass on the next row."""
         self.next_row_hits = 0
         self.seen_row_this_pass = False
+        self.passed_forward_tree = False
         self.last_row_seen_time = self.get_clock().now()
         self.clear_start_x = None
         self.clear_start_y = None
@@ -1221,7 +1251,7 @@ class SimpleRowFollower(Node):
                     "FOLLOW_OUT",
                     f"Lateral aligned: d={d:.2f}m (no strafe needed). Sweeping.")
                 return
-            self._strafe_dist = abs(err)
+            self._strafe_dist = min(abs(err), self.lateral_align_max_strafe)
             # Perpendicular headings off the outbound heading. For a row on the
             # right, "toward" is a right (CW, -) turn; "away" is a left (CCW, +).
             sign90 = -math.pi / 2.0 if self.current_side == "right" else math.pi / 2.0
@@ -1383,6 +1413,7 @@ class SimpleRowFollower(Node):
             # recalculate the heading to the saved start pose on the next tick.
             self.last_row_seen_time = self.get_clock().now()
             self.seen_row_this_pass = False
+            self.passed_forward_tree = False
             self.set_state(
                 self.avoid_previous_state,
                 f"Obstacle avoided. Resuming {self.avoid_previous_state}."
@@ -2011,6 +2042,7 @@ class SimpleRowFollower(Node):
                 self.arc_last_yaw = None
                 self.arc_accumulated_yaw = 0.0
                 self.seen_row_this_pass = False
+                self.passed_forward_tree = False
                 tgt = (math.degrees(self.return_target_yaw)
                        if self.return_target_yaw is not None else float("nan"))
                 self.set_state(
@@ -2048,11 +2080,31 @@ class SimpleRowFollower(Node):
             if opp_visible and abs(opp_fit[1]) <= self.next_row_max_dist:
                 self.next_row_hits += 1
 
-            # End the return pass via should_end_pass only (the original logic).
-            # (A geometric "last tree abeam" cut was tried here to stop an
-            # over-shoot south, but it ended the return EARLY mid-row, which then
-            # started row 2 too far north - worse. Reverted to baseline.)
-            if self.should_end_pass():
+            # End the return by POSITION - when the robot has driven back to the
+            # longitude where the outbound began (home, projected on the outbound
+            # axis). This sweeps the FULL row every time. The old perception end
+            # (should_end_pass) quit at the 10 s floor the instant the noodles
+            # dropped out of the fit for 2 s, leaving the robot stranded mid-row
+            # at the FAR end - which then started the next row from the wrong end.
+            # A geometric "last tree abeam" cut was also tried here and ended the
+            # return early too. Position is robust to both. max_pass_duration is
+            # the hard safety cap; fall back to should_end_pass only if there is
+            # no home/heading reference.
+            along = None
+            if (self.home_x is not None and self.odom_x is not None
+                    and self.outbound_yaw is not None):
+                along = ((self.odom_x - self.home_x) * math.cos(self.outbound_yaw)
+                         + (self.odom_y - self.home_y) * math.sin(self.outbound_yaw))
+                end_pass = (along <= self.return_end_margin
+                            or self.elapsed_in_state() >= self.max_pass_duration)
+            else:
+                end_pass = self.should_end_pass()
+            if end_pass:
+                _why = (f"reached home (along={along:+.2f}m)"
+                        if along is not None and along <= self.return_end_margin
+                        else f"timeout/lost (along={along}, "
+                             f"elapsed={self.elapsed_in_state():.1f}s)")
+                self.get_logger().warn(f"FOLLOW_BACK end: {_why}")
                 self.rows_completed += 1
                 next_row_seen = self.next_row_hits >= self.next_row_min_hits
 
