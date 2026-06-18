@@ -929,20 +929,26 @@ class SimpleRowFollower(Node):
             if self.arc_last_yaw is None:
                 self.arc_start_yaw = self.odom_yaw
                 self.arc_last_yaw = self.odom_yaw
-                # ONE-TIME centre placement on the LAST TREE itself - the most-
-                # forward tree still in view, i.e. the one we just drove past
-                # (CLEAR_END m back). Orbiting the tree (not the row-line foot,
-                # which sat CLEAR_END m beyond it and let the body swing in) keeps
-                # a constant arc_radius AROUND the tree. Read NOW while beside the
-                # row, not mid-arc when the cone straddles two rows.
+                # ONE-TIME centre on the PERPENDICULAR FOOT on the row line (to
+                # the side, so the robot's heading is tangent and the 180 deg
+                # arc swings FORWARD and crosses to the other side - a proper
+                # U-turn). Centring on the tree itself failed: by the time we
+                # turn we are ~0.5 m PAST it, so the tree is behind us and you
+                # can't forward-orbit a centre that's behind you. The robot ends
+                # well past the tree, so the foot-centred arc still clears it by
+                # sqrt(past^2 + 0.40^2) >> 0.40 m. Fit NOW (beside the row, not
+                # mid-arc when the cone straddles two rows).
                 self.arc_center_x = None
-                trees = (self.side_cone_points(self.current_side)
-                         if self.odom_x is not None else [])
-                if trees:
-                    ltx, lty = max(trees, key=lambda t: t[0])   # robot frame, fwd-most
-                    cth, sth = math.cos(self.odom_yaw), math.sin(self.odom_yaw)
-                    self.arc_center_x = self.odom_x + ltx * cth - lty * sth
-                    self.arc_center_y = self.odom_y + ltx * sth + lty * cth
+                fit = self.fit_row_line(self.current_side) if self.odom_x is not None else None
+                if fit is not None:
+                    _, perp, _ = fit
+                    th = self.odom_yaw
+                    if self.current_side == "right":
+                        tr_x, tr_y = math.sin(th), -math.cos(th)   # right of heading
+                    else:
+                        tr_x, tr_y = -math.sin(th), math.cos(th)   # left of heading
+                    self.arc_center_x = self.odom_x + abs(perp) * tr_x
+                    self.arc_center_y = self.odom_y + abs(perp) * tr_y
             else:
                 # SIGNED accumulation in the commanded turn direction:
                 # abs() would count yaw NOISE as progress (a "180 deg" arc
