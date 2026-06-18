@@ -9,7 +9,7 @@ from rclpy.executors import ExternalShutdownException
 
 from geometry_msgs.msg import TwistStamped, PoseArray
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, BatteryState
 from std_msgs.msg import Empty, String, Bool, Int32
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from rclpy.time import Time
@@ -100,6 +100,8 @@ class SimpleRowFollower(Node):
         self.create_subscription(Empty, "/resume_collection", self.resume_callback, 10)
         self.create_subscription(
             Int32, "/nuts/collected_count", self.collected_count_callback, _enable_qos)
+        # Battery safety (opt-in): pause + return home when voltage stays low.
+        self.create_subscription(BatteryState, "/battery", self.battery_callback, 10)
 
         # ---- Tree-aware collection of uncollected nuts (before return-home) ----
         # For each missed nut we drive to a sweep-entry point ON the nut's sweep
@@ -165,6 +167,18 @@ class SimpleRowFollower(Node):
         self.resume_headland_margin = float(self.get_parameter("resume_headland_margin").value)
         self.resume_wp_tol = float(self.get_parameter("resume_wp_tol").value)
         self.resume_max_duration = float(self.get_parameter("resume_max_duration").value)
+
+        # Battery safety (opt-in). /battery only populates `voltage` on this base
+        # (percentage/present are 0), so detect "low" by voltage held below a
+        # threshold for battery_low_duration s (rides out load sag). On trip it
+        # fires the same pause as /pause_collection - return home and wait.
+        # battery_min_voltage MUST be tuned to the actual pack (see the node log).
+        self.declare_parameter("battery_safety", False)
+        self.declare_parameter("battery_min_voltage", 10.0)   # volts; tune per pack
+        self.declare_parameter("battery_low_duration", 5.0)   # s held low before pausing
+        self.battery_safety = bool(self.get_parameter("battery_safety").value)
+        self.battery_min_voltage = float(self.get_parameter("battery_min_voltage").value)
+        self.battery_low_duration = float(self.get_parameter("battery_low_duration").value)
 
         self.uncollected_map: List[Tuple[float, float]] = []   # nut positions (map frame)
         self._collect_skip = set()                             # unreachable nuts to ignore
@@ -233,6 +247,9 @@ class SimpleRowFollower(Node):
         self._row_anchors: List[Tuple[float, float, str]] = []   # (x,y,side) per row
         self._recollecting = False
         self._recollect_rows: List[int] = []    # row indices still to re-sweep
+        # Battery safety: latest voltage + when it first dropped below threshold.
+        self._battery_voltage: Optional[float] = None
+        self._battery_low_since = None
 
         self.started = False
         self.state = "WAITING"
@@ -474,6 +491,7 @@ class SimpleRowFollower(Node):
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.publish_status("Simple row follower ready. Publish /sweep_start to begin.")
+        batt = (f"ON @{self.battery_min_voltage:.1f}V" if self.battery_safety else "off")
         self.get_logger().info(
             f"Ready (multi-row). CLEAR={self.clear_end_distance:.2f}m, "
             f"ARC r={self.arc_radius:.2f}m v={self.arc_linear_speed:.2f}m/s, "
@@ -483,7 +501,8 @@ class SimpleRowFollower(Node):
             f"lidar_yaw_offset={math.degrees(self.lidar_yaw_offset):+.0f}deg, "
             f"return_home={self.return_home_enabled}, manual_topic=/return_home, "
             f"avoid_front={self.avoid_front_distance:.2f}m, "
-            f"bag={self.bag or 'off'}, pause=/pause_collection, resume=/resume_collection"
+            f"bag={self.bag or 'off'}, pause=/pause_collection, resume=/resume_collection, "
+            f"battery_safety={batt}"
         )
 
     # -----------------------------
@@ -645,6 +664,31 @@ class SimpleRowFollower(Node):
 
     def collected_count_callback(self, msg: Int32):
         self._collected_total = int(msg.data)
+
+    def battery_callback(self, msg: BatteryState):
+        self._battery_voltage = float(msg.voltage)
+
+    def _battery_safety_check(self):
+        """If enabled, pause (return home) when the pack voltage stays below the
+        threshold for battery_low_duration while sweeping. Reset otherwise."""
+        if not self.battery_safety or self._battery_voltage is None:
+            return
+        if self._paused or self.state not in self._SWEEP_STATES:
+            self._battery_low_since = None
+            return
+        if self._battery_voltage >= self.battery_min_voltage:
+            self._battery_low_since = None          # recovered (or just a sag)
+            return
+        if self._battery_low_since is None:
+            self._battery_low_since = self.get_clock().now()
+        held = (self.get_clock().now() - self._battery_low_since).nanoseconds / 1e9
+        if held >= self.battery_low_duration:
+            self.get_logger().error(
+                f"BATTERY LOW: {self._battery_voltage:.2f}V < "
+                f"{self.battery_min_voltage:.2f}V for {held:.0f}s - "
+                f"pausing and returning home."
+            )
+            self._begin_pause(f"battery low ({self._battery_voltage:.2f}V)")
 
     def _begin_pause(self, reason: str):
         """Snapshot the row being swept, freeze perception, and head home to wait.
@@ -2247,6 +2291,8 @@ class SimpleRowFollower(Node):
         if not self.started:
             self.stop_robot()
             return
+        # Battery safety runs before everything else - it may pause this tick.
+        self._battery_safety_check()
         if self.latest_scan is None:
             self.stop_robot()
             self.publish_status("Waiting for /scan")

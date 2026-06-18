@@ -56,6 +56,7 @@ nav = _mod("nav_msgs.msg")
 nav.Odometry = type("Odometry", (), {})
 sens = _mod("sensor_msgs.msg")
 sens.LaserScan = type("LaserScan", (), {})
+sens.BatteryState = type("BatteryState", (), {})
 std = _mod("std_msgs.msg")
 for _n in ("Empty", "String", "Bool", "Int32"):
     setattr(std, _n, type(_n, (), {}))
@@ -149,6 +150,11 @@ def make_follower():
     f._row_anchors = []
     f._recollecting = False
     f._recollect_rows = []
+    f.battery_safety = False
+    f.battery_min_voltage = 10.0
+    f.battery_low_duration = 5.0
+    f._battery_voltage = None
+    f._battery_low_since = None
     # Params / gains
     f.resume_headland_margin = 0.40
     f.resume_wp_tol = 0.15
@@ -304,6 +310,59 @@ f2._row_anchors = [(0.0, 0.0, "right")]
 f2._map_to_odom = lambda: (0.0, 0.0, 1.0, 0.0)
 f2.uncollected_map = []
 check("no re-sweep when nothing is missed", f2._begin_recollect("done") is False)
+
+print("=== battery safety: pause + home only when enabled and held low ===")
+# Disabled: low voltage does nothing.
+f = make_follower()
+f.state = "FOLLOW_OUT"
+f.battery_safety = False
+f._battery_voltage = 9.0
+f._battery_safety_check()
+check("disabled: low voltage does NOT pause", f._paused is False and f.state == "FOLLOW_OUT")
+
+# Enabled, voltage fine: no pause, no low timer.
+f = make_follower()
+f.state = "FOLLOW_OUT"
+f.battery_safety = True
+f.battery_min_voltage = 10.0
+f._battery_voltage = 11.5
+f._battery_safety_check()
+check("healthy voltage does not arm the low timer",
+      f._paused is False and f._battery_low_since is None)
+
+# Enabled, just dropped low: debounced, not yet paused.
+f._battery_voltage = 9.5
+f._battery_safety_check()
+check("low voltage arms the timer but waits (debounce)",
+      f._paused is False and f._battery_low_since is not None)
+
+# Held low past the duration -> pause + return home.
+f._battery_low_since = _T(-6 * 10**9)      # 6 s ago (> 5 s duration)
+f._battery_safety_check()
+check("held low past duration pauses + returns home",
+      f._paused is True and f.state == "RETURN_HOME")
+
+# Recovery clears the timer (only relevant before a trip).
+f2 = make_follower()
+f2.state = "FOLLOW_OUT"
+f2.battery_safety = True
+f2.battery_min_voltage = 10.0
+f2._battery_voltage = 9.0
+f2._battery_safety_check()                  # arm
+f2._battery_voltage = 11.0
+f2._battery_safety_check()                  # recover
+check("voltage recovery clears the low timer", f2._battery_low_since is None
+      and f2._paused is False)
+
+# Not sweeping: timer resets, no pause (e.g. already returning home).
+f3 = make_follower()
+f3.state = "RETURN_HOME"
+f3.battery_safety = True
+f3._battery_voltage = 9.0
+f3._battery_low_since = _T(-9 * 10**9)
+f3._battery_safety_check()
+check("not in a sweep state: no battery pause", f3._paused is False
+      and f3._battery_low_since is None)
 
 print()
 print("=" * 60)

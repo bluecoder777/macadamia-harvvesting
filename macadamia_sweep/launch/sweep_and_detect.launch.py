@@ -29,6 +29,8 @@ def generate_launch_description():
     start_side = LaunchConfiguration("start_side")
     max_rows = LaunchConfiguration("max_rows")
     bag = LaunchConfiguration("bag")
+    battery_safety = LaunchConfiguration("battery_safety")
+    battery_min_voltage = LaunchConfiguration("battery_min_voltage")
     rgb_topic = LaunchConfiguration("rgb_topic")
     target_frame = LaunchConfiguration("target_frame")
     detect_mode = LaunchConfiguration("detect_mode")
@@ -42,6 +44,11 @@ def generate_launch_description():
         DeclareLaunchArgument("bag", default_value="0",
                               description="0 = off; >0 auto-pauses home after that many "
                                           "nuts, then again after each resume"),
+        DeclareLaunchArgument("battery_safety", default_value="false",
+                              description="true = pause + return home when /battery "
+                                          "voltage stays below battery_min_voltage"),
+        DeclareLaunchArgument("battery_min_voltage", default_value="10.0",
+                              description="low-battery threshold in volts (TUNE to pack)"),
         DeclareLaunchArgument("rgb_topic", default_value="/oak/rgb/image_rect"),
         DeclareLaunchArgument("target_frame", default_value="map"),
         DeclareLaunchArgument(
@@ -63,6 +70,8 @@ def generate_launch_description():
                 # max_rows / bag are int params; convert the launch-arg strings.
                 "max_rows": ParameterValue(max_rows, value_type=int),
                 "bag": ParameterValue(bag, value_type=int),
+                "battery_safety": ParameterValue(battery_safety, value_type=bool),
+                "battery_min_voltage": ParameterValue(battery_min_voltage, value_type=float),
             }],
         ),
 

@@ -46,6 +46,7 @@ nav = _mod("nav_msgs.msg")
 nav.Odometry = type("Odometry", (), {})
 sens = _mod("sensor_msgs.msg")
 sens.LaserScan = type("LaserScan", (), {})
+sens.BatteryState = type("BatteryState", (), {})
 std = _mod("std_msgs.msg")
 for _n in ("Empty", "String", "Bool", "Int32"):
     setattr(std, _n, type(_n, (), {}))
