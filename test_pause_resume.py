@@ -113,6 +113,10 @@ def make_follower():
     f.state_start_time = _T(0)
     f.started = True
     f.return_home_enabled = True
+    f.collect_before_home = True
+    f.start_side = "right"
+    f.desired_side_distance = 0.40
+    f.uncollected_map = []
     f.rows_completed = 2
     f.current_side = "right"
     f.next_row_hits = 0
@@ -142,6 +146,9 @@ def make_follower():
     f._collected_total = 0
     f._bag_start_count = 0
     f.bag = 0
+    f._row_anchors = []
+    f._recollecting = False
+    f._recollect_rows = []
     # Params / gains
     f.resume_headland_margin = 0.40
     f.resume_wp_tol = 0.15
@@ -254,6 +261,49 @@ check("no pause after 2 new (5-3 < 3)", f._paused is False)
 f._collected_total = 6                   # 3 new since resume
 f._bag_and_resume_tick()
 check("auto-pause again after 3 new (6-3 >= 3)", f._paused is True)
+
+print("=== missed-nut collection: map nuts to rows, re-sweep each ===")
+f = make_follower()
+f.outbound_yaw = 0.0                     # d=(1,0); right-side hug -> sweeper_unit=(0,-1)
+f.start_side = "right"
+f.desired_side_distance = 0.40
+# Three swept rows, 0.70 m apart laterally (more negative y = further across).
+f._row_anchors = [(0.0, 0.0, "right"), (0.0, -0.70, "right"), (0.0, -1.40, "right")]
+f._map_to_odom = lambda: (0.0, 0.0, 1.0, 0.0)    # identity map<->odom
+# Nuts sit on each row's tree line: lateral = anchor_lateral + 0.40 (so y is
+# 0.40 more negative than the anchor). Place one on row 0 and one on row 2.
+f.uncollected_map = [(1.0, -0.40), (1.2, -1.80)]
+rows = f._rows_with_missed_nuts()
+check("missed nuts map to their rows (0 and 2, not 1)", rows == [0, 2], rows)
+
+# Entry: queue those rows and start re-sweeping the first.
+started = f._begin_recollect("Sweep done.")
+check("recollect starts when rows have missed nuts", started is True)
+check("recollecting flag set", f._recollecting is True)
+check("first re-sweep targets row 1 (index 0) via RESUME_NAV",
+      f.state == "RESUME_NAV" and f._pause_row == 0, f"state={f.state} row={f._pause_row}")
+check("navigates to that row's anchor", f._pause_anchor == (0.0, 0.0), f._pause_anchor)
+check("re-sweep keeps detection off (not the resume gate)", f._resuming is False)
+check("queue holds the remaining row", f._recollect_rows == [2], f._recollect_rows)
+
+# FOLLOW_BACK end on the first re-sweep -> next queued row.
+f._recollect_next("Re-swept a row.")
+check("second re-sweep targets row 3 (index 2)",
+      f.state == "RESUME_NAV" and f._pause_row == 2, f"state={f.state} row={f._pause_row}")
+check("anchor for row 3", f._pause_anchor == (0.0, -1.40), f._pause_anchor)
+
+# Queue now empty -> go home.
+f._recollect_next("Re-swept a row.")
+check("recollect finishes -> RETURN_HOME", f.state == "RETURN_HOME", f.state)
+check("recollecting flag cleared", f._recollecting is False)
+
+# No missed nuts -> no re-sweep, straight home.
+f2 = make_follower()
+f2.outbound_yaw = 0.0
+f2._row_anchors = [(0.0, 0.0, "right")]
+f2._map_to_odom = lambda: (0.0, 0.0, 1.0, 0.0)
+f2.uncollected_map = []
+check("no re-sweep when nothing is missed", f2._begin_recollect("done") is False)
 
 print()
 print("=" * 60)

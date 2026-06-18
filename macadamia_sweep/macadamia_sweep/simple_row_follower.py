@@ -228,6 +228,11 @@ class SimpleRowFollower(Node):
         self._resume_phase = "HEADLAND"         # RESUME_NAV sub-phase
         self._collected_total = 0               # latest /nuts/collected_count
         self._bag_start_count = 0               # collected total when this bag began
+        # Missed-nut collection by RE-SWEEPING (same path as resume): the start
+        # anchor of every forward-swept row, and the queue of rows to re-sweep.
+        self._row_anchors: List[Tuple[float, float, str]] = []   # (x,y,side) per row
+        self._recollecting = False
+        self._recollect_rows: List[int] = []    # row indices still to re-sweep
 
         self.started = False
         self.state = "WAITING"
@@ -527,13 +532,19 @@ class SimpleRowFollower(Node):
         self._swept_path = []
         self._swept_long_min = self._swept_long_max = None
         self._swept_lat_min = self._swept_lat_max = None
-        # Fresh run: clear any pause/resume state and start a new bag.
+        # Fresh run: clear any pause/resume/recollect state and start a new bag.
         self._paused = False
         self._resuming = False
+        self._recollecting = False
+        self._recollect_rows = []
         self._return_end_state = "DONE"
         self._bag_start_count = self._collected_total
         self._row_start_anchor = (
             (self.odom_x, self.odom_y) if self.odom_x is not None else None)
+        # Row 0 starts here (home). Lazily filled by control_loop if odom is late.
+        self._row_anchors = (
+            [(self.odom_x, self.odom_y, self.current_side)]
+            if self.odom_x is not None else [])
 
         # Save the starting pose for RETURN_HOME. If odom is not ready yet,
         # control_loop will lazily fill this before the robot has moved far.
@@ -690,7 +701,8 @@ class SimpleRowFollower(Node):
         """Per-tick while actively sweeping: the bag auto-pause and, after a
         resume, the detection re-enable gate. Called from control_loop."""
         # Bag: park at home once `bag` NEW nuts have been collected this bag.
-        if (self.bag > 0 and not self._paused
+        # Suppressed during a re-sweep (end-of-mission cleanup).
+        if (self.bag > 0 and not self._paused and not self._recollecting
                 and self._collected_total - self._bag_start_count >= self.bag):
             self._begin_pause(f"bag full ({self.bag})")
             return
@@ -1322,6 +1334,12 @@ class SimpleRowFollower(Node):
             # skip back to on resume).
             if self.odom_x is not None:
                 self._row_start_anchor = (self.odom_x, self.odom_y)
+                # Append to the per-row anchor list ONLY for a brand-new forward
+                # row (len == rows_completed). Resume/recollect re-sweeps an
+                # already-recorded row, so the guard skips them.
+                if len(self._row_anchors) == self.rows_completed:
+                    self._row_anchors.append(
+                        (self.odom_x, self.odom_y, self.current_side))
             self.set_state("FOLLOW_OUT", f"{why}. Sweeping row.")
 
     def lateral_align(self):
@@ -1534,24 +1552,17 @@ class SimpleRowFollower(Node):
     # -----------------------------
 
     def finish_or_return_home(self, reason: str):
-        """Collect any uncollected nuts first (if enabled), then return home."""
+        """Re-sweep any row that still has missed nuts (same path as resume),
+        then return home."""
         self.stop_robot()
         # Sweep is over: freeze the nut world model AND the tree map for the rest
-        # of the mission (collection + return home) by pausing perception.
+        # of the mission (re-sweep + return home) by pausing perception. The
+        # drive-over collection in nut_tracker still picks up the missed nuts.
         self.set_perception(False)
-        if self.collect_before_home and self.uncollected_map:
-            self._collect_skip = set()
-            self._collect_target = None
-            self._collect_phase = "TO_HEADLAND"
-            self._collect_deadline = None
-            self._collect_avoid_count = 0
-            self._collect_consec_skips = 0
-            self.set_state(
-                "COLLECT_NUTS",
-                reason + f" Collecting {len(self.uncollected_map)} uncollected nut(s) "
-                f"before home."
-            )
-            return
+        if (self.collect_before_home and self.uncollected_map
+                and not self._recollecting):
+            if self._begin_recollect(reason):
+                return
         self._go_home(reason)
 
     def _go_home(self, reason: str):
@@ -1783,7 +1794,70 @@ class SimpleRowFollower(Node):
         )
 
     # -----------------------------
-    # COLLECT_NUTS - tree-aware pickup of missed nuts before home
+    # Missed-nut collection by RE-SWEEPING the row (same path as resume)
+    # -----------------------------
+
+    def _rows_with_missed_nuts(self):
+        """Indices of forward-swept rows that still hold uncollected nuts. Each
+        nut (map frame) is mapped to the row whose sweep line (start anchor +
+        hug offset, in row-lateral) is nearest it."""
+        tf = self._map_to_odom()
+        units = self._row_units()
+        if tf is None or units is None or not self._row_anchors:
+            return []
+        (_dx, _dy), (sx, sy) = units
+        # Expected nut lateral for each row = the robot's anchor lateral plus the
+        # hug offset (the nuts sit on the tree line, desired_side_distance away on
+        # the hug side, which is +sweeper_unit).
+        exp = [ax * sx + ay * sy + self.desired_side_distance
+               for (ax, ay, _s) in self._row_anchors]
+        rows = set()
+        for (mx, my) in self.uncollected_map:
+            ox, oy = self._apply_tf(mx, my, tf)
+            nut_lat = ox * sx + oy * sy
+            best_i = min(range(len(exp)), key=lambda i: abs(nut_lat - exp[i]))
+            rows.add(best_i)
+        return sorted(rows)
+
+    def _begin_recollect(self, reason: str) -> bool:
+        """If any swept row still has missed nuts, queue those rows for a re-sweep
+        and start. Returns True if a re-sweep was started."""
+        rows = self._rows_with_missed_nuts()
+        if not rows:
+            return False
+        self._recollect_rows = rows
+        self._recollecting = True
+        self._recollect_next(
+            reason + f" {len(self.uncollected_map)} nut(s) missed; re-sweeping "
+            f"row(s) {[r + 1 for r in rows]}."
+        )
+        return True
+
+    def _recollect_next(self, reason: str = ""):
+        """Re-sweep the next queued row (navigate to its start via RESUME_NAV),
+        or go home when the queue is empty."""
+        while self._recollect_rows:
+            row = self._recollect_rows.pop(0)
+            if row < len(self._row_anchors) and self._row_anchors[row] is not None:
+                ax, ay, side = self._row_anchors[row]
+                self._pause_row = row
+                self._pause_side = side
+                self._pause_anchor = (ax, ay)
+                self._resuming = False          # recollect: perception stays off
+                self._resume_phase = "HEADLAND"
+                self.set_state(
+                    "RESUME_NAV",
+                    (reason + " " if reason else "")
+                    + f"Re-sweeping row {row + 1} for missed nuts."
+                )
+                return
+            self.get_logger().warn(f"Recollect: no anchor for row {row + 1}, skipping.")
+        self._recollecting = False
+        self._go_home(reason or "Re-swept all rows with missed nuts.")
+
+    # -----------------------------
+    # COLLECT_NUTS - tree-aware pickup of missed nuts before home (SUPERSEDED by
+    # the re-sweep above; kept for reference, no longer entered)
     # -----------------------------
 
     def uncollected_callback(self, msg: PoseArray):
@@ -2197,6 +2271,8 @@ class SimpleRowFollower(Node):
                 f"Lazy home saved: x={self.home_x:+.2f}, y={self.home_y:+.2f}, "
                 f"yaw={math.degrees(self.home_yaw or 0.0):+.1f}deg"
             )
+            if not self._row_anchors:           # row 0 start (odom was late at start)
+                self._row_anchors = [(self.home_x, self.home_y, self.current_side)]
 
         # Record where the robot has driven during the sweep - that swept box is
         # known-free ground and bounds where collection may stage its run-in.
@@ -2298,6 +2374,10 @@ class SimpleRowFollower(Node):
                         else f"timeout/lost (along={along}, "
                              f"elapsed={self.elapsed_in_state():.1f}s)")
                 self.get_logger().warn(f"FOLLOW_BACK end: {_why}")
+                if self._recollecting:
+                    # Re-sweep pass done: on to the next missed row (or home).
+                    self._recollect_next("Re-swept a row for missed nuts.")
+                    return
                 self.rows_completed += 1
                 next_row_seen = self.next_row_hits >= self.next_row_min_hits
 
