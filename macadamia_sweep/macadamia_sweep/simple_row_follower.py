@@ -10,7 +10,7 @@ from rclpy.executors import ExternalShutdownException
 from geometry_msgs.msg import TwistStamped, PoseArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Empty, String, Bool
+from std_msgs.msg import Empty, String, Bool, Int32
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from rclpy.time import Time
 import tf2_ros
@@ -95,6 +95,11 @@ class SimpleRowFollower(Node):
         self.create_subscription(Empty, "/sweep_start", self.start_callback, 10)
         self.create_subscription(Empty, "/sweep_stop", self.stop_callback, 10)
         self.create_subscription(Empty, "/return_home", self.return_home_callback, 10)
+        # Pause/resume: park at home on pause, skip back to the paused row on resume.
+        self.create_subscription(Empty, "/pause_collection", self.pause_callback, 10)
+        self.create_subscription(Empty, "/resume_collection", self.resume_callback, 10)
+        self.create_subscription(
+            Int32, "/nuts/collected_count", self.collected_count_callback, _enable_qos)
 
         # ---- Tree-aware collection of uncollected nuts (before return-home) ----
         # For each missed nut we drive to a sweep-entry point ON the nut's sweep
@@ -148,6 +153,19 @@ class SimpleRowFollower(Node):
         self.path_wp_tol = float(self.get_parameter("path_wp_tol").value)
         self.path_lookahead = int(self.get_parameter("path_lookahead").value)
 
+        # Pause/resume + bag. bag=0 disables the auto-pause; bag>0 parks the robot
+        # at home after that many nuts are collected, then again after each
+        # resume collects that many MORE. resume_headland_margin is how far into
+        # the open buffer (beyond the row starts) the lateral traverse stays.
+        self.declare_parameter("bag", 0)
+        self.declare_parameter("resume_headland_margin", 0.40)
+        self.declare_parameter("resume_wp_tol", 0.15)
+        self.declare_parameter("resume_max_duration", 90.0)   # per-leg stuck cap
+        self.bag = int(self.get_parameter("bag").value)
+        self.resume_headland_margin = float(self.get_parameter("resume_headland_margin").value)
+        self.resume_wp_tol = float(self.get_parameter("resume_wp_tol").value)
+        self.resume_max_duration = float(self.get_parameter("resume_max_duration").value)
+
         self.uncollected_map: List[Tuple[float, float]] = []   # nut positions (map frame)
         self._collect_skip = set()                             # unreachable nuts to ignore
         self._collect_target: Optional[Tuple[float, float]] = None
@@ -194,6 +212,22 @@ class SimpleRowFollower(Node):
         self.home_x: Optional[float] = None
         self.home_y: Optional[float] = None
         self.home_yaw: Optional[float] = None
+
+        # Pause/resume state. On pause the robot parks at home (RETURN_HOME ends
+        # at _return_end_state) and remembers the row it was on; on resume it
+        # skips back to that row's start (RESUME_NAV) and re-sweeps from there,
+        # detection held off until it reaches the spot it paused at.
+        self._paused = False
+        self._resuming = False
+        self._return_end_state = "DONE"        # RETURN_HOME hand-off (DONE / PAUSED)
+        self._pause_row = 0                     # rows_completed at pause
+        self._pause_side = self.start_side      # current_side at pause
+        self._pause_along = 0.0                 # along-row progress (rel. home) at pause
+        self._pause_anchor: Optional[Tuple[float, float]] = None   # paused row start (odom)
+        self._row_start_anchor: Optional[Tuple[float, float]] = None  # this row's start
+        self._resume_phase = "HEADLAND"         # RESUME_NAV sub-phase
+        self._collected_total = 0               # latest /nuts/collected_count
+        self._bag_start_count = 0               # collected total when this bag began
 
         self.started = False
         self.state = "WAITING"
@@ -443,7 +477,8 @@ class SimpleRowFollower(Node):
             f"row_group_gap={self.row_group_gap:.2f}m, "
             f"lidar_yaw_offset={math.degrees(self.lidar_yaw_offset):+.0f}deg, "
             f"return_home={self.return_home_enabled}, manual_topic=/return_home, "
-            f"avoid_front={self.avoid_front_distance:.2f}m"
+            f"avoid_front={self.avoid_front_distance:.2f}m, "
+            f"bag={self.bag or 'off'}, pause=/pause_collection, resume=/resume_collection"
         )
 
     # -----------------------------
@@ -492,6 +527,13 @@ class SimpleRowFollower(Node):
         self._swept_path = []
         self._swept_long_min = self._swept_long_max = None
         self._swept_lat_min = self._swept_lat_max = None
+        # Fresh run: clear any pause/resume state and start a new bag.
+        self._paused = False
+        self._resuming = False
+        self._return_end_state = "DONE"
+        self._bag_start_count = self._collected_total
+        self._row_start_anchor = (
+            (self.odom_x, self.odom_y) if self.odom_x is not None else None)
 
         # Save the starting pose for RETURN_HOME. If odom is not ready yet,
         # control_loop will lazily fill this before the robot has moved far.
@@ -569,6 +611,102 @@ class SimpleRowFollower(Node):
             f"x={self.home_x:+.2f}, y={self.home_y:+.2f}."
         )
         self.get_logger().warn("Manual return-home requested")
+
+    def pause_callback(self, _msg: Empty):
+        """Manual pause: park at home and wait for /resume_collection."""
+        self._begin_pause("manual pause")
+
+    def resume_callback(self, _msg: Empty):
+        """Resume from a pause: skip back to the paused row and re-sweep it."""
+        if not self._paused:
+            self.get_logger().warn("resume_collection ignored - not paused.")
+            return
+        self._paused = False
+        self._resuming = True
+        self._return_end_state = "DONE"
+        self._bag_start_count = self._collected_total   # next bag counts new nuts
+        self._resume_phase = "HEADLAND"
+        self.set_state(
+            "RESUME_NAV",
+            f"Resuming: navigating back to row {self._pause_row + 1}."
+        )
+        self.get_logger().warn(f"RESUME: heading back to row {self._pause_row + 1}")
+
+    def collected_count_callback(self, msg: Int32):
+        self._collected_total = int(msg.data)
+
+    def _begin_pause(self, reason: str):
+        """Snapshot the row being swept, freeze perception, and head home to wait.
+        Shared by the manual pause and the bag auto-pause."""
+        if not self.started or self._paused:
+            return
+        if self.state not in self._SWEEP_STATES:
+            self.get_logger().warn(
+                f"Pause ignored ({reason}): not actively sweeping (state={self.state})."
+            )
+            return
+        # Remember which row + where on it, so resume can skip straight back.
+        self._pause_row = self.rows_completed
+        self._pause_side = self.current_side
+        if (self.outbound_yaw is not None and self.home_x is not None
+                and self.odom_x is not None):
+            self._pause_along = (
+                (self.odom_x - self.home_x) * math.cos(self.outbound_yaw)
+                + (self.odom_y - self.home_y) * math.sin(self.outbound_yaw))
+        else:
+            self._pause_along = 0.0
+        self._pause_anchor = self._row_start_anchor or (
+            (self.home_x, self.home_y) if self.home_x is not None else None)
+        self._paused = True
+        self._resuming = False
+        self.set_perception(False)            # no detection while paused / heading home
+        self.stop_robot()
+        if self.return_home_enabled and self.home_x is not None and self.home_y is not None:
+            self._return_end_state = "PAUSED"
+            self._home_phase = "OUT"
+            self.next_row_hits = 0
+            self.clear_start_x = None
+            self.clear_start_y = None
+            self.arc_start_yaw = None
+            self.arc_last_yaw = None
+            self.arc_accumulated_yaw = 0.0
+            self.set_state(
+                "RETURN_HOME",
+                f"Paused ({reason}) on row {self._pause_row + 1}. Returning home; "
+                f"waiting for /resume_collection."
+            )
+        else:
+            self.set_state(
+                "PAUSED", f"Paused ({reason}); no home pose - holding in place."
+            )
+        self.get_logger().warn(f"PAUSE: {reason} on row {self._pause_row + 1}")
+
+    def _finish_return(self, reason: str):
+        """RETURN_HOME completion hand-off: PAUSED if a pause is active, else DONE."""
+        self.stop_robot()
+        self.set_state(self._return_end_state, reason)
+
+    def _bag_and_resume_tick(self):
+        """Per-tick while actively sweeping: the bag auto-pause and, after a
+        resume, the detection re-enable gate. Called from control_loop."""
+        # Bag: park at home once `bag` NEW nuts have been collected this bag.
+        if (self.bag > 0 and not self._paused
+                and self._collected_total - self._bag_start_count >= self.bag):
+            self._begin_pause(f"bag full ({self.bag})")
+            return
+        # Resume: hold detection off over the already-swept part of the row, then
+        # re-enable the moment we drive back up to where we paused (no duplicates).
+        if (self._resuming and self.outbound_yaw is not None
+                and self.home_x is not None and self.odom_x is not None):
+            along = (
+                (self.odom_x - self.home_x) * math.cos(self.outbound_yaw)
+                + (self.odom_y - self.home_y) * math.sin(self.outbound_yaw))
+            if along >= self._pause_along:
+                self.set_perception(True)
+                self._resuming = False
+                self.get_logger().info(
+                    f"Resumed detection at the pause area (along={along:+.2f}m)."
+                )
 
     # -----------------------------
     # Helpers
@@ -1180,6 +1318,10 @@ class SimpleRowFollower(Node):
         if self._strafe_next_state == "FOLLOW_BACK":
             self._enter_follow_back(f"{why}. Sweeping back.")
         else:
+            # Outbound pass starting here: record the row's start (for a pause to
+            # skip back to on resume).
+            if self.odom_x is not None:
+                self._row_start_anchor = (self.odom_x, self.odom_y)
             self.set_state("FOLLOW_OUT", f"{why}. Sweeping row.")
 
     def lateral_align(self):
@@ -1557,9 +1699,87 @@ class SimpleRowFollower(Node):
                 return
 
         self.stop_robot()
-        self.set_state(
-            "DONE",
-            f"Returned to start. Final distance={dist:.2f}m. Mission complete."
+        self._finish_return(
+            f"Returned to start. Final distance={dist:.2f}m."
+            + ("" if self._paused else " Mission complete.")
+        )
+
+    def resume_nav(self):
+        """Skip back to the paused row's start through the open buffer, then
+        re-align. Phases HEADLAND -> TRAVERSE -> TO_ROW are go-to waypoints (kept
+        in the buffer, clear of the row starts); ALIGN_OUT rotates to the outbound
+        heading; then the crab (LATERAL_ALIGN) does the lateral re-align to 0.40 m
+        and hands to FOLLOW_OUT. Detection stays off until the resume gate fires."""
+        if self.elapsed_in_state() > self.resume_max_duration:
+            self.get_logger().warn("RESUME_NAV leg timed out - resuming from here.")
+            self._resume_start_sweep("RESUME_NAV timeout")
+            return
+
+        if (self.odom_x is None or self.odom_yaw is None
+                or self.outbound_yaw is None or self.home_x is None
+                or self._pause_anchor is None):
+            self.stop_robot()
+            self.publish_status("RESUME_NAV waiting for odom/home/anchor.")
+            return
+
+        # Row-frame basis at home: d along outbound, across perpendicular.
+        cth, sth = math.cos(self.outbound_yaw), math.sin(self.outbound_yaw)
+        dxu, dyu = cth, sth
+        axu, ayu = -sth, cth
+        ax, ay = self._pause_anchor
+        a_a = (ax - self.home_x) * dxu + (ay - self.home_y) * dyu
+        l_a = (ax - self.home_x) * axu + (ay - self.home_y) * ayu
+        headland_a = min(0.0, a_a) - self.resume_headland_margin
+        w1 = (self.home_x + headland_a * dxu, self.home_y + headland_a * dyu)
+        w2 = (w1[0] + l_a * axu, w1[1] + l_a * ayu)
+        w3 = (ax, ay)
+        tol = self.resume_wp_tol
+        row = self._pause_row + 1
+
+        if self._resume_phase == "HEADLAND":
+            if self._drive_to(w1[0], w1[1], tol, "RESUME_NAV"):
+                self._resume_phase = "TRAVERSE"
+            else:
+                self.publish_status(f"RESUME_NAV into buffer -> row {row}")
+            return
+        if self._resume_phase == "TRAVERSE":
+            if self._drive_to(w2[0], w2[1], tol, "RESUME_NAV"):
+                self._resume_phase = "TO_ROW"
+            else:
+                self.publish_status(f"RESUME_NAV crossing buffer to row {row}")
+            return
+        if self._resume_phase == "TO_ROW":
+            if self._drive_to(w3[0], w3[1], tol, "RESUME_NAV"):
+                self._resume_phase = "ALIGN_OUT"
+            else:
+                self.publish_status(f"RESUME_NAV entering row {row}")
+            return
+        # ALIGN_OUT: rotate in place to the outbound heading, then re-sweep.
+        err = self.normalize_angle(self.outbound_yaw - self.odom_yaw)
+        if abs(err) < self.align_parallel_tol:
+            self._resume_start_sweep(f"Back at row {row}")
+            return
+        mag = min(self.align_max_angular,
+                  max(self.min_align_angular, self.k_align * abs(err)))
+        self.publish_cmd(0.0, math.copysign(mag, err))
+        self.publish_status(f"RESUME_NAV align-out row {row} | err={math.degrees(err):+.0f}deg")
+
+    def _resume_start_sweep(self, reason: str):
+        """Restore the paused row's bookkeeping and re-enter the sweep via the
+        crab (heading already aligned; crab does the lateral re-align to 0.40 m)."""
+        self.rows_completed = self._pause_row
+        self.current_side = self._pause_side
+        self.seen_row_this_pass = False
+        self.passed_forward_tree = False
+        self.next_row_hits = 0
+        self.clear_start_x = None
+        self.clear_start_y = None
+        self.arc_start_yaw = None
+        self.arc_last_yaw = None
+        self.arc_accumulated_yaw = 0.0
+        self._enter_strafe(
+            "FOLLOW_OUT",
+            f"{reason}. Re-aligning; detection off until the pause spot."
         )
 
     # -----------------------------
@@ -1732,9 +1952,10 @@ class SimpleRowFollower(Node):
         dipx, dipy = pt(dip_long, l_lat)
         return (sx, sy, dipx, dipy, end_long, l_lat)
 
-    def _drive_to(self, tx: float, ty: float, tol: float) -> bool:
+    def _drive_to(self, tx: float, ty: float, tol: float,
+                  avoid_state: str = "COLLECT_NUTS") -> bool:
         """Go-to-point with the RETURN_HOME control style + AVOID_FRONT safety.
-        Returns True when within tol."""
+        avoid_state is the state AVOID_FRONT resumes into. Returns True within tol."""
         if self.odom_x is None or self.odom_yaw is None:
             self.stop_robot()
             return False
@@ -1744,7 +1965,7 @@ class SimpleRowFollower(Node):
             return False
         if front < self.avoid_front_distance:
             self._collect_avoid_count += 1
-            self.enter_avoid_front("COLLECT_NUTS", f"front={front:.2f}m during collect")
+            self.enter_avoid_front(avoid_state, f"front={front:.2f}m during {avoid_state}")
             return False
         dx = tx - self.odom_x
         dy = ty - self.odom_y
@@ -1981,6 +2202,7 @@ class SimpleRowFollower(Node):
         # known-free ground and bounds where collection may stage its run-in.
         if self.state in self._SWEEP_STATES:
             self._update_swept_bounds()
+            self._bag_and_resume_tick()
 
         if self.state == "FOLLOW_OUT":
             self.follow_side(self.current_side)
@@ -2122,6 +2344,17 @@ class SimpleRowFollower(Node):
 
         elif self.state == "RETURN_HOME":
             self.return_home()
+
+        elif self.state == "RESUME_NAV":
+            self.resume_nav()
+
+        elif self.state == "PAUSED":
+            self.stop_robot()
+            self.publish_status(
+                f"PAUSED at home after row {self._pause_row + 1} - "
+                f"publish /resume_collection to continue."
+            )
+            return
 
         elif self.state == "DONE":
             self.stop_robot()

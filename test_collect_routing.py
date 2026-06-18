@@ -47,7 +47,7 @@ nav.Odometry = type("Odometry", (), {})
 sens = _mod("sensor_msgs.msg")
 sens.LaserScan = type("LaserScan", (), {})
 std = _mod("std_msgs.msg")
-for _n in ("Empty", "String", "Bool"):
+for _n in ("Empty", "String", "Bool", "Int32"):
     setattr(std, _n, type(_n, (), {}))
 tf2 = _mod("tf2_ros")
 tf2.Buffer = type("Buffer", (), {})

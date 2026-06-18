@@ -26,6 +26,7 @@ Subscribes:
 Publishes:
     /nuts/markers           visualization_msgs/MarkerArray   spheres + count
     /nuts/uncollected       geometry_msgs/PoseArray (latched) for the picker
+    /nuts/collected_count   std_msgs/Int32 (latched)   running collected total
     /snc_status             std_msgs/String   "Nuts: collected X / total Y"
 
 Run:
@@ -45,7 +46,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from rclpy.executors import ExternalShutdownException
 
 from geometry_msgs.msg import PoseArray, Pose
-from std_msgs.msg import String
+from std_msgs.msg import String, Int32
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -141,6 +142,10 @@ class NutTracker(Node):
         self.uncollected_pub = self.create_publisher(
             PoseArray, "/nuts/uncollected", latched
         )
+        # Running count of collected nuts (latched, so a follower that starts or
+        # re-subscribes later still gets the current total). Drives the row
+        # follower's "bag" auto-pause.
+        self.count_pub = self.create_publisher(Int32, "/nuts/collected_count", latched)
 
         self.create_subscription(
             PoseArray, "/nuts/detections", self.detections_callback, 10
@@ -284,6 +289,7 @@ class NutTracker(Node):
         m = String()
         m.data = f"Nuts: collected {collected} / total {len(conf)}"
         self.status_pub.publish(m)
+        self.count_pub.publish(Int32(data=collected))
 
     def publish_uncollected(self):
         conf = self.confirmed()

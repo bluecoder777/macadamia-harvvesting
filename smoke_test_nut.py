@@ -131,6 +131,7 @@ sys.modules["sensor_msgs.msg"].CameraInfo = _CameraInfo
 std = _mod("std_msgs"); _mod("std_msgs.msg")
 sys.modules["std_msgs.msg"].String = _String
 sys.modules["std_msgs.msg"].Bool = type("Bool", (), {"__init__": lambda self: setattr(self, "data", False)})
+sys.modules["std_msgs.msg"].Int32 = type("Int32", (), {"__init__": lambda self, data=0: setattr(self, "data", data)})
 vis = _mod("visualization_msgs"); _mod("visualization_msgs.msg")
 sys.modules["visualization_msgs.msg"].Marker = _Marker
 sys.modules["visualization_msgs.msg"].MarkerArray = _MarkerArray
@@ -389,6 +390,7 @@ class _TF:
 trk.get_clock = lambda: _Clk()
 trk.get_logger = lambda: _Log()
 trk.uncollected_pub = _Pub(); trk.status_pub = _Pub(); trk.marker_pub = _Pub()
+trk.count_pub = _Pub()
 # The sweeper is offset 0.40 m to the hug side (right). With yaw=0 the sweeper
 # sits at (rx, ry-0.40), so to drive the sweeper onto nut #0 (~1.02,1.00) the
 # robot body must be at (1.02, 1.40).
@@ -415,6 +417,7 @@ trk2 = make_tracker()
 trk2.get_clock = lambda: _Clk()
 trk2.get_logger = lambda: _Log()
 trk2.uncollected_pub = _Pub(); trk2.status_pub = _Pub(); trk2.marker_pub = _Pub()
+trk2.count_pub = _Pub()
 for _ in range(3):
     trk2.associate(3.00, 3.00)   # confirm a nut under the robot centre
 trk2.tf_buffer = _TF(3.00, 3.00)
