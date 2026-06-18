@@ -300,14 +300,11 @@ class SimpleRowFollower(Node):
         self.max_pass_duration = 90.0
         self.row_lost_timeout = 2.0
 
-        # CLEAR_END: how far to drive PAST the last tree before the U-turn. The
-        # arc centre is placed at the robot's position here, so this is also how
-        # far the orbit centre sits BEYOND the last tree - and the clearance to
-        # that tree is (arc_radius - this). 0.15 m left only ~0.25 m (the body
-        # then clipped the tree). ~0.05 m centres the orbit ON the last tree, so
-        # the robot keeps the full ~0.40 m (= arc_radius) around it. Lower this
-        # for more clearance; raise arc_radius if you also want a wider berth.
-        self.declare_parameter("clear_end_distance", 0.05)
+        # CLEAR_END: drive this far PAST the last tree before starting the
+        # U-turn, so the robot has room to turn in without its front swinging
+        # into the tree. The arc then orbits the LAST TREE itself at arc_radius,
+        # so the tree clearance is ~arc_radius regardless of this value.
+        self.declare_parameter("clear_end_distance", 0.15)
         self.clear_end_distance = float(
             self.get_parameter("clear_end_distance").value
         )
@@ -932,21 +929,20 @@ class SimpleRowFollower(Node):
             if self.arc_last_yaw is None:
                 self.arc_start_yaw = self.odom_yaw
                 self.arc_last_yaw = self.odom_yaw
-                # ONE-TIME centre placement on the actual row line. Fit the row
-                # NOW (robot beside it, not straddling) and step its measured
-                # perpendicular distance toward it - that lands the centre on the
-                # tree line regardless of the exact start distance.
+                # ONE-TIME centre placement on the LAST TREE itself - the most-
+                # forward tree still in view, i.e. the one we just drove past
+                # (CLEAR_END m back). Orbiting the tree (not the row-line foot,
+                # which sat CLEAR_END m beyond it and let the body swing in) keeps
+                # a constant arc_radius AROUND the tree. Read NOW while beside the
+                # row, not mid-arc when the cone straddles two rows.
                 self.arc_center_x = None
-                fit = self.fit_row_line(self.current_side) if self.odom_x is not None else None
-                if fit is not None:
-                    _, perp, _ = fit
-                    th = self.odom_yaw
-                    if self.current_side == "right":
-                        tr_x, tr_y = math.sin(th), -math.cos(th)   # right of heading
-                    else:
-                        tr_x, tr_y = -math.sin(th), math.cos(th)   # left of heading
-                    self.arc_center_x = self.odom_x + abs(perp) * tr_x
-                    self.arc_center_y = self.odom_y + abs(perp) * tr_y
+                trees = (self.side_cone_points(self.current_side)
+                         if self.odom_x is not None else [])
+                if trees:
+                    ltx, lty = max(trees, key=lambda t: t[0])   # robot frame, fwd-most
+                    cth, sth = math.cos(self.odom_yaw), math.sin(self.odom_yaw)
+                    self.arc_center_x = self.odom_x + ltx * cth - lty * sth
+                    self.arc_center_y = self.odom_y + ltx * sth + lty * cth
             else:
                 # SIGNED accumulation in the commanded turn direction:
                 # abs() would count yaw NOISE as progress (a "180 deg" arc
