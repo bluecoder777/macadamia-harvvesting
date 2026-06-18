@@ -449,18 +449,18 @@ class SimpleRowFollower(Node):
         # avoid_front_distance is the early warning distance. When the
         # front LiDAR sees something closer than this, the robot performs
         # a small recovery manoeuvre instead of continuing into the tree.
-        self.declare_parameter("avoid_front_distance", 0.28)
+        self.declare_parameter("avoid_front_distance", 0.35)
         self.avoid_front_distance = float(
             self.get_parameter("avoid_front_distance").value
         )
 
-        self.avoid_backup_speed = -0.04
+        self.avoid_backup_speed = -0.05
         self.avoid_turn_speed = 0.28
         self.avoid_forward_speed = 0.05
 
-        self.avoid_backup_duration = 1.2
-        self.avoid_turn_duration = 1.8
-        self.avoid_forward_duration = 1.8
+        self.avoid_backup_duration = 2.0
+        self.avoid_turn_duration = 2.2
+        self.avoid_forward_duration = 2.0
 
         self.avoid_previous_state = "FOLLOW_OUT"
         self.avoid_phase = "BACKUP"
