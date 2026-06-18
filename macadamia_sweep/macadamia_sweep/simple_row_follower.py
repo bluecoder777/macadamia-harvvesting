@@ -1917,6 +1917,17 @@ class SimpleRowFollower(Node):
             lost = self.should_end_pass()
             if abeam or lost:
                 trigger = "last tree abeam" if abeam else "row lost"
+                # DIAGNOSTIC: why did the outbound pass end here? Logs the
+                # trigger + how many trees were seen and how far ahead the
+                # forward-most one was, so an EARLY end is obvious in the
+                # terminal (e.g. abeam with fwd_tree_x small = forward trees
+                # dropped out of detection before we reached the real last tree).
+                _pts = self.side_cone_points(self.current_side)
+                _fwd = max((p[0] for p in _pts), default=float("nan"))
+                self.get_logger().warn(
+                    f"FOLLOW_OUT end: {trigger} | trees_seen={len(_pts)} "
+                    f"fwd_tree_x={_fwd:+.2f}m elapsed={self.elapsed_in_state():.1f}s"
+                )
                 self.clear_start_x = None
                 self.clear_start_y = None
                 self.arc_start_yaw = None
