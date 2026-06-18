@@ -171,7 +171,7 @@ class SimpleRowFollower(Node):
         # States in which the robot is actively sweeping the field (so its pose
         # marks free ground). Excludes COLLECT_NUTS/RETURN_HOME/AVOID/idle.
         self._SWEEP_STATES = (
-            "FOLLOW_OUT", "CLEAR_END", "ARC_TURN", "ALIGN",
+            "FOLLOW_OUT", "CLEAR_END", "ARC_TURN", "ALIGN", "LATERAL_ALIGN",
             "FOLLOW_BACK", "CLEAR_NEXT", "TURN_NEXT",
         )
 
@@ -213,7 +213,7 @@ class SimpleRowFollower(Node):
         self.arc_start_yaw: Optional[float] = None
         self.arc_last_yaw: Optional[float] = None
         self.arc_accumulated_yaw = 0.0
-        self.arc_center_x: Optional[float] = None   # fixed U-turn centre (odom)
+        self.arc_center_x: Optional[float] = None   # U-turn centre on the row line
         self.arc_center_y: Optional[float] = None
 
         # ---------------------------------------------------------------
@@ -260,6 +260,20 @@ class SimpleRowFollower(Node):
         self.max_follow_angular = 0.30
 
         self.start_straight_duration = 1.5
+
+        # LATERAL_ALIGN: after the in-place pivot to a new row, drive the robot
+        # out to desired_side_distance from that row BEFORE sweeping it, so every
+        # row (not just row 1, which the operator places by hand) starts the
+        # outbound pass - and therefore the U-turn - at the correct 0.40 m. The
+        # pivot leaves it ~0.30 m from the next row (0.70 m spacing - 0.40 m hug);
+        # nothing else re-establishes the distance.
+        self.declare_parameter("lateral_align_tol", 0.05)        # m, |dist-0.40|
+        self.declare_parameter("lateral_align_speed", 0.04)      # low: mostly lateral
+        self.declare_parameter("lateral_align_max_duration", 12.0)
+        self.lateral_align_tol = float(self.get_parameter("lateral_align_tol").value)
+        self.lateral_align_speed = float(self.get_parameter("lateral_align_speed").value)
+        self.lateral_align_max_duration = float(
+            self.get_parameter("lateral_align_max_duration").value)
 
         # -----------------------------
         # Row detection (cluster-then-fit)
@@ -310,10 +324,14 @@ class SimpleRowFollower(Node):
         self.arc_linear_speed = 0.06
         self.arc_max_yaw = math.radians(220.0)
         self.arc_distance_gain = 0.6
-        # Hold the U-turn radius closed-loop on a FIXED odom centre (on the row
-        # line, set at arc start) so the open-loop arc can't drift wide when the
-        # base drives faster than commanded - that drift was leaving the return
-        # sweep starting too far from the row / too close to the next one.
+        # Hold the U-turn radius closed-loop around a centre fixed ON THE ROW
+        # LINE (placed by a ONE-TIME lidar fit at arc start - reliable because
+        # the robot is beside the row then, unlike mid-arc when it straddles two
+        # rows). This keeps the orbit at arc_radius from the actual tree line, so
+        # it can't drift wide toward the next row, and - because the centre is on
+        # the real row, not assumed 0.40 m away - it pulls the robot OUT to
+        # arc_radius if it starts a touch close, instead of orbiting into the
+        # tree (the ram the assumed-0.40 version caused on row 2).
         self.declare_parameter("arc_radius_gain", 1.2)
         self.arc_radius_gain = float(self.get_parameter("arc_radius_gain").value)
 
@@ -909,20 +927,21 @@ class SimpleRowFollower(Node):
             if self.arc_last_yaw is None:
                 self.arc_start_yaw = self.odom_yaw
                 self.arc_last_yaw = self.odom_yaw
-                # Fix the turn centre ON the row line: the robot is one
-                # arc_radius from the row on the hug side, so step arc_radius
-                # toward that side from here. Right of heading th = (sin,-cos);
-                # left = (-sin,cos).
-                if self.odom_x is not None:
+                # ONE-TIME centre placement on the actual row line. Fit the row
+                # NOW (robot beside it, not straddling) and step its measured
+                # perpendicular distance toward it - that lands the centre on the
+                # tree line regardless of the exact start distance.
+                self.arc_center_x = None
+                fit = self.fit_row_line(self.current_side) if self.odom_x is not None else None
+                if fit is not None:
+                    _, perp, _ = fit
                     th = self.odom_yaw
                     if self.current_side == "right":
-                        tr_x, tr_y = math.sin(th), -math.cos(th)
+                        tr_x, tr_y = math.sin(th), -math.cos(th)   # right of heading
                     else:
-                        tr_x, tr_y = -math.sin(th), math.cos(th)
-                    self.arc_center_x = self.odom_x + self.arc_radius * tr_x
-                    self.arc_center_y = self.odom_y + self.arc_radius * tr_y
-                else:
-                    self.arc_center_x = None    # open-loop until odom is back
+                        tr_x, tr_y = -math.sin(th), math.cos(th)   # left of heading
+                    self.arc_center_x = self.odom_x + abs(perp) * tr_x
+                    self.arc_center_y = self.odom_y + abs(perp) * tr_y
             else:
                 # SIGNED accumulation in the commanded turn direction:
                 # abs() would count yaw NOISE as progress (a "180 deg" arc
@@ -937,18 +956,16 @@ class SimpleRowFollower(Node):
         v = self.arc_linear_speed
         base_omega = v / self.arc_radius
 
-        # ODOMETRY arc, radius held closed-loop on the FIXED centre set above -
-        # NOT on lidar (mid-arc the robot straddles the row line and a lidar fit
-        # grabs the neighbouring row, tightening into the last tree). Using a
-        # fixed odom centre keeps the clean geometry AND stops the open-loop
-        # radius drifting wide when the base overshoots the commanded speed.
+        # Hold the orbit at arc_radius around the fixed, on-row-line centre. With
+        # the centre on the real row, "too far from centre" means too wide (more
+        # omega -> tighten) and "too close" means heading into the tree (less
+        # omega -> widen, pulling OUT to arc_radius). Falls back to open-loop
+        # constant omega if the start fit failed (no centre).
         omega = base_omega
         dist_c = self.arc_radius
         if self.arc_center_x is not None and self.odom_x is not None:
             dist_c = math.hypot(self.odom_x - self.arc_center_x,
                                 self.odom_y - self.arc_center_y)
-            # Too far from centre -> arc too wide -> tighten (more omega);
-            # too close -> loosen. Normalised by radius, clamped to sane range.
             scale = 1.0 + self.arc_radius_gain * (dist_c - self.arc_radius) / self.arc_radius
             omega = base_omega * max(0.4, min(2.5, scale))
 
@@ -1126,7 +1143,62 @@ class SimpleRowFollower(Node):
         self.arc_accumulated_yaw = 0.0
         # current_side is UNCHANGED: after the in-place 180 the next row
         # sits on the same commanded side as the previous one did.
-        self.set_state("FOLLOW_OUT", status)
+        # Correct the lateral offset to 0.40 m BEFORE sweeping (the pivot leaves
+        # us ~0.30 m from the new row); then FOLLOW_OUT starts at the right
+        # distance so the U-turn lands on the row line.
+        self.set_state("LATERAL_ALIGN", status + " Correcting lateral offset.")
+
+    def lateral_align(self):
+        """After the in-place pivot, drive out to desired_side_distance from the
+        new row BEFORE sweeping it. A diff-drive base can't translate sideways,
+        so this is a LOW-speed forward creep with strong cross-track correction
+        (mostly lateral); it exits to FOLLOW_OUT once we're within
+        lateral_align_tol of 0.40 m and parallel, or on timeout."""
+        front = self.get_front_distance()
+        if front < self.emergency_stop_distance:
+            self.stop_robot()
+            self.publish_status(f"EMERGENCY STOP during LATERAL_ALIGN: front={front:.2f}m")
+            return
+        if front < self.avoid_front_distance:
+            self.enter_avoid_front("LATERAL_ALIGN", f"front={front:.2f}m")
+            return
+
+        visible, fit = self.row_visible(self.current_side)
+        if not visible:
+            # New row not seen yet (e.g. between trees) - creep forward to find
+            # it; hand to FOLLOW_OUT if it stays unseen so we never stall here.
+            self.publish_cmd(self.search_speed, 0.0)
+            self.publish_status("LATERAL_ALIGN | searching for next row")
+            if self.elapsed_in_state() > self.lateral_align_max_duration:
+                self.set_state("FOLLOW_OUT",
+                               "LATERAL_ALIGN gave up finding row - sweeping.")
+            return
+
+        line_angle, perp, n = fit
+        self.mark_row_seen_if_visible(True)
+        desired_perp = (-self.desired_side_distance
+                        if self.current_side == "right" else self.desired_side_distance)
+        move_left = perp - desired_perp
+
+        if (abs(move_left) < self.lateral_align_tol
+                and abs(line_angle) < self.align_parallel_tol):
+            self.set_state(
+                "FOLLOW_OUT",
+                f"Lateral-aligned: d={abs(perp):.2f}m "
+                f"(target {self.desired_side_distance:.2f}). Sweeping next row."
+            )
+            return
+
+        angular = self.k_xtrack * move_left + self.k_heading * line_angle
+        angular = max(-self.max_follow_angular, min(self.max_follow_angular, angular))
+        self.publish_cmd(self.lateral_align_speed, angular)
+        self.publish_status(
+            f"LATERAL_ALIGN {self.current_side.upper()} d={abs(perp):.2f}->"
+            f"{self.desired_side_distance:.2f}m | "
+            f"line_ang={math.degrees(line_angle):+.0f}deg | front={front:.2f}m"
+        )
+        if self.elapsed_in_state() > self.lateral_align_max_duration:
+            self.set_state("FOLLOW_OUT", "LATERAL_ALIGN timeout - sweeping anyway.")
 
     # -----------------------------
     # FRONT OBSTACLE AVOIDANCE
@@ -1868,6 +1940,9 @@ class SimpleRowFollower(Node):
 
         elif self.state == "ALIGN":
             self.align_to_row()
+
+        elif self.state == "LATERAL_ALIGN":
+            self.lateral_align()
 
         elif self.state == "FOLLOW_BACK":
             self.follow_side(self.current_side)
