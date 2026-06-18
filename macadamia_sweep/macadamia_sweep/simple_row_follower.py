@@ -271,29 +271,22 @@ class SimpleRowFollower(Node):
 
         self.start_straight_duration = 1.5
 
-        # LATERAL_ALIGN: after the in-place pivot to a new row, drive the robot
-        # out to desired_side_distance from that row BEFORE sweeping it, so every
-        # row (not just row 1, which the operator places by hand) starts the
-        # outbound pass at the correct 0.40 m. The pivot leaves it ~0.30 m from
-        # the next row (0.70 m spacing - 0.40 m hug); nothing else re-establishes
-        # the distance.
+        # LATERAL_ALIGN: a PURE-Y mecanum strafe (no forward/back) to set the
+        # distance to the row on current_side to exactly desired_side_distance.
+        # Used in TWO places: after the U-turn's heading ALIGN (-> FOLLOW_BACK)
+        # and when starting a new row after the pivot (-> FOLLOW_OUT), so every
+        # pass begins at a true 0.40 m. The base is mecanum, so this is a single
+        # commanded linear.y - no rotate-drive-rotate crab.
         self.declare_parameter("lateral_align_tol", 0.05)        # m, |dist-0.40|
-        self.declare_parameter("lateral_align_speed", 0.04)      # low: mostly lateral
         self.declare_parameter("lateral_align_max_duration", 12.0)
         self.lateral_align_tol = float(self.get_parameter("lateral_align_tol").value)
-        self.lateral_align_speed = float(self.get_parameter("lateral_align_speed").value)
         self.lateral_align_max_duration = float(
             self.get_parameter("lateral_align_max_duration").value)
-        # Strafe sub-state machine: MEASURE -> TURN (90 deg to perpendicular) ->
-        # STRAFE (drive the measured offset sideways) -> BACK (90 deg to outbound).
-        self._lat_phase = "MEASURE"
-        self._strafe_dist = 0.0
-        self._strafe_heading = 0.0
-        self._strafe_start: Optional[Tuple[float, float]] = None
-        # Cap the sideways crab so one bad lidar fit can't fling the robot far
-        # off the row ("no need to go further away"). The pivot only ever leaves
-        # ~0.10 m to correct (0.70 m spacing - 0.40 m hug), so 0.25 m is plenty.
-        self.lateral_align_max_strafe = 0.25
+        self.strafe_speed = 0.08          # m/s, max lateral (linear.y)
+        self.k_strafe = 1.2               # lateral P-gain on the distance error
+        # Where the strafe hands off when finished: FOLLOW_OUT (new row) or
+        # FOLLOW_BACK (after the U-turn). Set by _enter_strafe.
+        self._strafe_next_state = "FOLLOW_OUT"
 
         # -----------------------------
         # Row detection (cluster-then-fit)
@@ -600,11 +593,12 @@ class SimpleRowFollower(Node):
             self.publish_status(status)
         self.get_logger().info(f"State changed to {new_state}")
 
-    def publish_cmd(self, linear: float, angular: float):
+    def publish_cmd(self, linear: float, angular: float, lateral: float = 0.0):
         m = TwistStamped()
         m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = "base_link"
         m.twist.linear.x = float(linear)
+        m.twist.linear.y = float(lateral)   # mecanum strafe (+y = left); 0 otherwise
         m.twist.angular.z = float(angular)
         self.cmd_pub.publish(m)
 
@@ -1057,10 +1051,11 @@ class SimpleRowFollower(Node):
         err = self.normalize_angle(self.return_target_yaw - self.odom_yaw)
 
         if abs(err) < self.align_parallel_tol:
-            self._enter_follow_back(
+            self._enter_strafe(
+                "FOLLOW_BACK",
                 f"ALIGN done. odom_yaw={math.degrees(self.odom_yaw):+.1f} "
                 f"target={math.degrees(self.return_target_yaw):+.1f} "
-                f"err={math.degrees(err):+.1f}deg. Sweeping back."
+                f"err={math.degrees(err):+.1f}deg. Strafing to 0.40 m."
             )
             return
 
@@ -1076,8 +1071,9 @@ class SimpleRowFollower(Node):
         )
 
         if self.elapsed_in_state() > self.align_max_duration:
-            self._enter_follow_back(
-                f"ALIGN timeout. err={math.degrees(err):+.0f}deg."
+            self._enter_strafe(
+                "FOLLOW_BACK",
+                f"ALIGN timeout. err={math.degrees(err):+.0f}deg. Strafing to 0.40 m."
             )
 
     def _enter_follow_back(self, status: str):
@@ -1162,111 +1158,69 @@ class SimpleRowFollower(Node):
         # current_side is UNCHANGED: after the in-place 180 the next row
         # sits on the same commanded side as the previous one did. Strafe to
         # exactly 0.40 m before sweeping (the pivot leaves us ~0.30 m off).
-        self._lat_phase = "MEASURE"
-        self._strafe_start = None
-        self.set_state("LATERAL_ALIGN", status + " Correcting lateral offset.")
+        self._enter_strafe("FOLLOW_OUT", status + " Strafing to 0.40 m.")
+
+    def _enter_strafe(self, next_state: str, status: str):
+        """Enter the pure-Y strafe, remembering where to hand off when done."""
+        self._strafe_next_state = next_state
+        self.set_state("LATERAL_ALIGN", status)
+
+    def _finish_strafe(self, why: str):
+        """Leave the strafe for whichever pass requested it."""
+        self.stop_robot()
+        if self._strafe_next_state == "FOLLOW_BACK":
+            self._enter_follow_back(f"{why}. Sweeping back.")
+        else:
+            self.set_state("FOLLOW_OUT", f"{why}. Sweeping row.")
 
     def lateral_align(self):
-        """After the in-place pivot, STRAFE to exactly desired_side_distance from
-        the new row BEFORE sweeping it. A forward creep hands off short (it exits
-        the moment it is within tolerance and the weak cross-track never recovers
-        the rest), which left earlier rows hugging ~0.33 m. Instead crab:
-
-          MEASURE  - read the row, compute the lateral error.
-          TURN     - rotate in place 90 deg to face perpendicular to the row.
-          STRAFE   - drive the measured offset sideways (away if too close,
-                     toward if too far), tracked by odom displacement.
-          BACK     - rotate in place back to the outbound heading.
-
-        This lands the whole next pass (and its U-turn) at a true 0.40 m."""
+        """PURE-Y mecanum strafe: set the distance to the row on current_side to
+        exactly desired_side_distance with NO forward/back motion (linear.x = 0),
+        holding heading parallel to the row. Runs in BOTH transitions - after the
+        U-turn's heading ALIGN (-> FOLLOW_BACK) and at the start of a new row
+        after the pivot (-> FOLLOW_OUT); _strafe_next_state selects the hand-off.
+        The base is mecanum, so this is a single commanded linear.y, not a
+        rotate-drive-rotate crab."""
         front = self.get_front_distance()
         if front < self.emergency_stop_distance:
             self.stop_robot()
-            self.publish_status(f"EMERGENCY STOP during LATERAL_ALIGN: front={front:.2f}m")
+            self.publish_status(f"EMERGENCY STOP during STRAFE: front={front:.2f}m")
             return
         if front < self.avoid_front_distance:
             self.enter_avoid_front("LATERAL_ALIGN", f"front={front:.2f}m")
             return
-        if self.odom_x is None or self.odom_yaw is None or self.outbound_yaw is None:
-            self.stop_robot()
-            self.publish_status("LATERAL_ALIGN cannot proceed: no odom/heading.")
-            return
         if self.elapsed_in_state() > self.lateral_align_max_duration:
-            self.set_state("FOLLOW_OUT", "LATERAL_ALIGN timeout - sweeping anyway.")
+            self._finish_strafe("STRAFE timeout")
             return
 
-        if self._lat_phase == "MEASURE":
-            visible, fit = self.row_visible(self.current_side)
-            if not visible:
-                # New row not seen yet (e.g. between trees) - creep forward to
-                # find it before we can measure the offset.
-                self.publish_cmd(self.search_speed, 0.0)
-                self.publish_status("LATERAL_ALIGN | searching for next row")
-                return
-            self.mark_row_seen_if_visible(True)
-            _, perp, _ = fit
-            d = abs(perp)
-            err = d - self.desired_side_distance     # >0 too far, <0 too close
-            if abs(err) < self.lateral_align_tol:
-                self.set_state(
-                    "FOLLOW_OUT",
-                    f"Lateral aligned: d={d:.2f}m (no strafe needed). Sweeping.")
-                return
-            self._strafe_dist = min(abs(err), self.lateral_align_max_strafe)
-            # Perpendicular headings off the outbound heading. For a row on the
-            # right, "toward" is a right (CW, -) turn; "away" is a left (CCW, +).
-            sign90 = -math.pi / 2.0 if self.current_side == "right" else math.pi / 2.0
-            toward = self.normalize_angle(self.outbound_yaw + sign90)
-            away = self.normalize_angle(self.outbound_yaw - sign90)
-            self._strafe_heading = away if err < 0 else toward
-            self._strafe_start = None
-            self._lat_phase = "TURN"
-            self.publish_status(
-                f"LATERAL_ALIGN measured d={d:.2f}m -> strafe "
-                f"{self._strafe_dist:.2f}m {'out' if err < 0 else 'in'}")
+        visible, fit = self.row_visible(self.current_side)
+        if not visible:
+            # Can't measure the offset without the row. Nudge forward slowly to
+            # reacquire it (e.g. sitting in a gap between trees), then strafe.
+            self.publish_cmd(self.search_speed, 0.0)
+            self.publish_status("STRAFE | searching for row")
+            return
+        self.mark_row_seen_if_visible(True)
+
+        line_angle, perp, n = fit
+        desired_perp = (-self.desired_side_distance
+                        if self.current_side == "right" else self.desired_side_distance)
+        move_left = perp - desired_perp     # +ve -> strafe LEFT (+y) to open the gap
+        if (abs(move_left) < self.lateral_align_tol
+                and abs(line_angle) < self.align_parallel_tol):
+            self._finish_strafe(f"strafed to d={abs(perp):.2f}m")
             return
 
-        if self._lat_phase == "TURN":
-            e = self.normalize_angle(self._strafe_heading - self.odom_yaw)
-            if abs(e) < self.align_parallel_tol:
-                self.stop_robot()
-                self._strafe_start = (self.odom_x, self.odom_y)
-                self._lat_phase = "STRAFE"
-                return
-            mag = min(self.align_max_angular,
-                      max(self.min_align_angular, self.k_align * abs(e)))
-            self.publish_cmd(0.0, math.copysign(mag, e))
-            self.publish_status(
-                f"LATERAL_ALIGN strafe-turn | err={math.degrees(e):+.0f}deg")
-            return
-
-        if self._lat_phase == "STRAFE":
-            traveled = math.hypot(self.odom_x - self._strafe_start[0],
-                                  self.odom_y - self._strafe_start[1])
-            if traveled >= self._strafe_dist:
-                self.stop_robot()
-                self._lat_phase = "BACK"
-                return
-            self.publish_cmd(self.lateral_align_speed, 0.0)
-            self.publish_status(
-                f"LATERAL_ALIGN strafing {traveled:.2f}/{self._strafe_dist:.2f}m "
-                f"| front={front:.2f}m")
-            return
-
-        if self._lat_phase == "BACK":
-            e = self.normalize_angle(self.outbound_yaw - self.odom_yaw)
-            if abs(e) < self.align_parallel_tol:
-                self.stop_robot()
-                self.set_state(
-                    "FOLLOW_OUT",
-                    f"Strafed to {self.desired_side_distance:.2f}m. Sweeping next row.")
-                return
-            mag = min(self.align_max_angular,
-                      max(self.min_align_angular, self.k_align * abs(e)))
-            self.publish_cmd(0.0, math.copysign(mag, e))
-            self.publish_status(
-                f"LATERAL_ALIGN strafe-back | err={math.degrees(e):+.0f}deg")
-            return
+        vy = max(-self.strafe_speed, min(self.strafe_speed, self.k_strafe * move_left))
+        # Gentle heading hold so the strafe stays perpendicular to the row.
+        angular = max(-self.max_follow_angular,
+                      min(self.max_follow_angular, self.k_heading * line_angle))
+        self.publish_cmd(0.0, angular, vy)     # linear.x = 0 -> pure-Y strafe
+        self.publish_status(
+            f"STRAFE {self.current_side.upper()} d={abs(perp):.2f}->"
+            f"{self.desired_side_distance:.2f}m | vy={vy:+.2f} "
+            f"line_ang={math.degrees(line_angle):+.0f}deg -> {self._strafe_next_state}"
+        )
 
     # -----------------------------
     # FRONT OBSTACLE AVOIDANCE
