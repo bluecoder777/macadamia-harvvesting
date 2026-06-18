@@ -6,8 +6,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package="macadamia_sweep",
-            executable="simple_row_follower",
-            name="simple_row_follower",
+            executable="row_follower_3t",
+            name="row_follower_3t",
             output="screen",
         ),
     ])

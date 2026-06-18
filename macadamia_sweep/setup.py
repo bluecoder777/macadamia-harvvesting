@@ -7,7 +7,7 @@ package_name = "macadamia_sweep"
 setup(
     name=package_name,
     version="0.0.0",
-    packages=[package_name],
+    packages=[package_name, package_name + ".three_tier"],
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
@@ -23,7 +23,7 @@ setup(
     license="MIT",
     entry_points={
         'console_scripts': [
-    'simple_row_follower = macadamia_sweep.simple_row_follower:main',
+    'row_follower_3t = macadamia_sweep.three_tier.agent:main',
     'sweep_logger = macadamia_sweep.sweep_logger:main',
     'nut_detector = macadamia_sweep.nut_detector:main',
     'nut_tracker = macadamia_sweep.nut_tracker:main',

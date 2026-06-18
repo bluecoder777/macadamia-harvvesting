@@ -7,7 +7,7 @@ Two nodes, added to the `macadamia_sweep` package:
 | `nut_detector` | Perception | RGB → HSV colour mask → circular blobs → ground-plane projection → `/nuts/detections` (PoseArray in `map`). Stateless per frame. |
 | `nut_tracker` | World model / mission | De-dups detections into unique nuts, marks them **collected** when the robot drives over them, publishes RViz spheres + a saved list of uncollected nuts. |
 
-This is the **three-layer** split: perception (`nut_detector`) → world model + mission state (`nut_tracker`) → reactive control (`simple_row_follower`).
+This is the **three-layer** split: perception (`nut_detector`) → world model + mission state (`nut_tracker`) → reactive control (`row_follower_3t`).
 
 ## Why these design choices (from the robot's real setup)
 
@@ -163,4 +163,4 @@ cat ~/nut_locations.csv            # on shutdown: id,x,y,collected,hits
 - Detections arriving in a frame other than `map` → tracker ignores them (it warns).
 
 ## Note on running with the row follower
-`simple_row_follower` and Nav2 both drive `/cmd_vel_nav` — run only one of them at a time. The nut nodes are **read-only** w.r.t. motion (they never publish velocity), so they're safe to run alongside either.
+`row_follower_3t` and Nav2 both drive `/cmd_vel_nav` — run only one of them at a time. The nut nodes are **read-only** w.r.t. motion (they never publish velocity), so they're safe to run alongside either.

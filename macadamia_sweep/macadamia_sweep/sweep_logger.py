@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive diagnostic logger for the macadamia sweep follower.
 
-This is a STANDALONE node that runs alongside simple_row_follower (or any
+This is a STANDALONE node that runs alongside row_follower_3t (or any
 controller publishing on /cmd_vel_nav). It subscribes to every relevant
 topic, captures ground truth for the trees once at startup, and writes a
 single CSV plus a human-readable trace so a bad run can be analysed offline

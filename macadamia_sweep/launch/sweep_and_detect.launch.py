@@ -48,11 +48,11 @@ def generate_launch_description():
             "diag_csv", default_value="",
             description="path to write a per-blob diagnostic CSV (empty = off)"),
 
-        # --- Sweep controller (waits for /sweep_start) ---
+        # --- Sweep controller (3T architecture; waits for /sweep_start) ---
         Node(
             package="macadamia_sweep",
-            executable="simple_row_follower",
-            name="simple_row_follower",
+            executable="row_follower_3t",
+            name="row_follower_3t",
             output="screen",
             parameters=[{
                 "start_side": start_side,

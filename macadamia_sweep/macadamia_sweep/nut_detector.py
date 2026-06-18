@@ -24,7 +24,7 @@ Why this design (decided from the robot's real setup, captured live):
 This node is deliberately stateless per-frame. All persistence, de-duplication
 and the collected/uncollected bookkeeping live in nut_tracker.py (the world
 model). That separation is the three-layer split: perception here, world model
-+ mission logic there, reactive control in simple_row_follower.py.
++ mission logic there, reactive control in three_tier/ (row_follower_3t).
 
 Pipeline (per processed frame):
     RGB(rect) -> HSV -> colour mask (two hue bands for red/raspberry wrap)
