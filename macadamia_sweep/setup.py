@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
     'simple_row_follower = macadamia_sweep.simple_row_follower:main',
     'sweep_logger = macadamia_sweep.sweep_logger:main',
+    'mission_summary_logger = macadamia_sweep.mission_summary_logger:main',
     'nut_detector = macadamia_sweep.nut_detector:main',
     'nut_tracker = macadamia_sweep.nut_tracker:main',
     'tree_mapper = macadamia_sweep.tree_mapper:main',
