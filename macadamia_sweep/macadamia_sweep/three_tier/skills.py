@@ -550,11 +550,78 @@ class Skills:
                 return RUNNING
 
         self.io.stop_robot()
-        return (Event.HOME_REACHED,
-                f"Returned to start. Final distance={dist:.2f}m. Mission complete.")
+        # Reached start: hand off to _return_end_state (DONE, or PAUSED when a
+        # pause is active). The sequencer applies the hand-off.
+        return (Event.RETURN_FINISHED,
+                f"Returned to start. Final distance={dist:.2f}m."
+                + ("" if wm._paused else " Mission complete."))
 
     # -----------------------------
-    # COLLECT_NUTS - tree-aware pickup helpers + skill
+    # RESUME_NAV - skip back to a paused / missed row, then re-sweep
+    # -----------------------------
+    def resume_nav(self):
+        """Skip back to the paused row's start through the open buffer, then
+        re-align. HEADLAND -> TRAVERSE -> TO_ROW are go-to waypoints (kept in the
+        buffer, clear of the row starts); ALIGN_OUT rotates to the outbound
+        heading; on arrival the sequencer restores the row and re-enters via the
+        crab. Returns RUNNING, or (RESUME_DONE, reason) to start the sweep."""
+        wm = self.wm
+        if self._elapsed_in_state() > wm.resume_max_duration:
+            self.io.log_warn("RESUME_NAV leg timed out - resuming from here.")
+            return (Event.RESUME_DONE, "RESUME_NAV timeout")
+
+        if (wm.odom_x is None or wm.odom_yaw is None
+                or wm.outbound_yaw is None or wm.home_x is None
+                or wm._pause_anchor is None):
+            self.io.stop_robot()
+            self.io.publish_status("RESUME_NAV waiting for odom/home/anchor.")
+            return RUNNING
+
+        # Row-frame basis at home: d along outbound, across perpendicular.
+        cth, sth = math.cos(wm.outbound_yaw), math.sin(wm.outbound_yaw)
+        dxu, dyu = cth, sth
+        axu, ayu = -sth, cth
+        ax, ay = wm._pause_anchor
+        a_a = (ax - wm.home_x) * dxu + (ay - wm.home_y) * dyu
+        l_a = (ax - wm.home_x) * axu + (ay - wm.home_y) * ayu
+        headland_a = min(0.0, a_a) - wm.resume_headland_margin
+        w1 = (wm.home_x + headland_a * dxu, wm.home_y + headland_a * dyu)
+        w2 = (w1[0] + l_a * axu, w1[1] + l_a * ayu)
+        w3 = (ax, ay)
+        tol = wm.resume_wp_tol
+        row = wm._pause_row + 1
+
+        if wm._resume_phase == "HEADLAND":
+            if self._drive_to(w1[0], w1[1], tol, "RESUME_NAV"):
+                wm._resume_phase = "TRAVERSE"
+            else:
+                self.io.publish_status(f"RESUME_NAV into buffer -> row {row}")
+            return RUNNING
+        if wm._resume_phase == "TRAVERSE":
+            if self._drive_to(w2[0], w2[1], tol, "RESUME_NAV"):
+                wm._resume_phase = "TO_ROW"
+            else:
+                self.io.publish_status(f"RESUME_NAV crossing buffer to row {row}")
+            return RUNNING
+        if wm._resume_phase == "TO_ROW":
+            if self._drive_to(w3[0], w3[1], tol, "RESUME_NAV"):
+                wm._resume_phase = "ALIGN_OUT"
+            else:
+                self.io.publish_status(f"RESUME_NAV entering row {row}")
+            return RUNNING
+        # ALIGN_OUT: rotate in place to the outbound heading, then re-sweep.
+        err = normalize_angle(wm.outbound_yaw - wm.odom_yaw)
+        if abs(err) < wm.align_parallel_tol:
+            return (Event.RESUME_DONE, f"Back at row {row}")
+        mag = min(wm.align_max_angular,
+                  max(wm.min_align_angular, wm.k_align * abs(err)))
+        self.io.publish_cmd(0.0, math.copysign(mag, err))
+        self.io.publish_status(
+            f"RESUME_NAV align-out row {row} | err={math.degrees(err):+.0f}deg")
+        return RUNNING
+
+    # -----------------------------
+    # COLLECT_NUTS - tree-aware pickup helpers + skill (superseded by re-sweep)
     # -----------------------------
     def _map_to_odom(self):
         return self.io.map_to_odom()
@@ -682,8 +749,11 @@ class Skills:
         dipx, dipy = pt(dip_long, l_lat)
         return (sx, sy, dipx, dipy, end_long, l_lat)
 
-    def _drive_to(self, tx: float, ty: float, tol: float) -> bool:
-        """Go-to-point with the RETURN_HOME control style + AVOID_FRONT safety."""
+    def _drive_to(self, tx: float, ty: float, tol: float,
+                  avoid_state: str = "COLLECT_NUTS") -> bool:
+        """Go-to-point with the RETURN_HOME control style + AVOID_FRONT safety.
+        avoid_state names the move (for the avoidance status); AVOID_FRONT always
+        resumes the currently-active state. Returns True within tol."""
         wm = self.wm
         if wm.odom_x is None or wm.odom_yaw is None:
             self.io.stop_robot()
@@ -694,7 +764,7 @@ class Skills:
             return False
         if front < wm.avoid_front_distance:
             wm._collect_avoid_count += 1
-            self.enter_avoid(f"front={front:.2f}m during collect")
+            self.enter_avoid(f"front={front:.2f}m during {avoid_state}")
             return False
         dx = tx - wm.odom_x
         dy = ty - wm.odom_y

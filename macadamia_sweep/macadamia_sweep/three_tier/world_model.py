@@ -48,6 +48,17 @@ class WorldModel:
         self.path_wp_tol = 0.20
         self.path_lookahead = 1
 
+        # Pause/resume + bag. bag=0 disables the auto-pause; bag>0 parks at home
+        # after that many nuts are collected, then again after each resume.
+        self.bag = 0
+        self.resume_headland_margin = 0.40
+        self.resume_wp_tol = 0.15
+        self.resume_max_duration = 90.0      # per-leg stuck cap
+        # Battery safety (opt-in): pause + return home when voltage stays low.
+        self.battery_safety = False
+        self.battery_min_voltage = 10.0      # volts; tune per pack
+        self.battery_low_duration = 5.0      # s held low before pausing
+
         self.uncollected_map: List[Tuple[float, float]] = []
         self._collect_skip = set()
         self._collect_target: Optional[Tuple[float, float]] = None
@@ -58,6 +69,29 @@ class WorldModel:
         self._collect_best = float("inf")
         self._path_idx: Optional[int] = None
         self._path_goal: Optional[int] = None
+
+        # Pause/resume state. On pause the robot parks at home and remembers the
+        # row it was on; on resume it skips back to that row's start (RESUME_NAV)
+        # and re-sweeps, detection held off until it reaches the pause spot.
+        self._paused = False
+        self._resuming = False
+        self._return_end_state = "DONE"      # RETURN_HOME hand-off (DONE / PAUSED)
+        self._pause_row = 0                   # rows_completed at pause
+        self._pause_side = "right"            # current_side at pause
+        self._pause_along = 0.0               # along-row progress (rel. home) at pause
+        self._pause_anchor: Optional[Tuple[float, float]] = None   # paused row start
+        self._row_start_anchor: Optional[Tuple[float, float]] = None  # this row's start
+        self._resume_phase = "HEADLAND"       # RESUME_NAV sub-phase
+        self._collected_total = 0             # latest /nuts/collected_count
+        self._bag_start_count = 0             # collected total when this bag began
+        # Missed-nut collection by RE-SWEEPING (same path as resume): the start
+        # anchor of every forward-swept row, and the queue of rows to re-sweep.
+        self._row_anchors: List[Tuple[float, float, str]] = []   # (x,y,side) per row
+        self._recollecting = False
+        self._recollect_rows: List[int] = []  # row indices still to re-sweep
+        # Battery safety: latest voltage + when it first dropped below threshold.
+        self._battery_voltage: Optional[float] = None
+        self._battery_low_since = None
 
         # Bounding box of the swept region, in ROW-FRAME coords.
         self._swept_long_min: Optional[float] = None
@@ -191,13 +225,13 @@ class WorldModel:
         self._home_phase = "GOAL"
 
         # FRONT OBSTACLE AVOIDANCE.
-        self.avoid_front_distance = 0.28
-        self.avoid_backup_speed = -0.04
+        self.avoid_front_distance = 0.35
+        self.avoid_backup_speed = -0.05
         self.avoid_turn_speed = 0.28
         self.avoid_forward_speed = 0.05
-        self.avoid_backup_duration = 1.2
-        self.avoid_turn_duration = 1.8
-        self.avoid_forward_duration = 1.8
+        self.avoid_backup_duration = 2.0
+        self.avoid_turn_duration = 2.2
+        self.avoid_forward_duration = 2.0
         self.avoid_previous_state = "FOLLOW_OUT"
         self.avoid_phase = "BACKUP"
         self.avoid_phase_start_time = None

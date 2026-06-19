@@ -35,8 +35,10 @@ class Skill:
     CLEAR_NEXT = "CLEAR_NEXT"
     TURN_NEXT = "TURN_NEXT"
     AVOID_FRONT = "AVOID_FRONT"
-    COLLECT_NUTS = "COLLECT_NUTS"
+    COLLECT_NUTS = "COLLECT_NUTS"   # superseded by re-sweep collection; never entered
     RETURN_HOME = "RETURN_HOME"
+    RESUME_NAV = "RESUME_NAV"       # skip back to a paused/missed row and re-sweep it
+    PAUSED = "PAUSED"               # parked at home, waiting for /resume_collection
     DONE = "DONE"
     STOPPED = "STOPPED"
 
@@ -60,5 +62,7 @@ class Event:
     TURNED = "TURNED"
     TURN_TIMEOUT = "TURN_TIMEOUT"
     TURN_NO_REF = "TURN_NO_REF"
-    HOME_REACHED = "HOME_REACHED"
+    HOME_REACHED = "HOME_REACHED"        # return aborted (timeout / no home) -> DONE
+    RETURN_FINISHED = "RETURN_FINISHED"  # reached start -> hand to _return_end_state
+    RESUME_DONE = "RESUME_DONE"          # resume_nav arrived/timed out -> start sweep
     COLLECT_GO_HOME = "COLLECT_GO_HOME"  # collection finished/aborted -> go home

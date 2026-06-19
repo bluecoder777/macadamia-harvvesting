@@ -21,8 +21,9 @@ from rclpy.executors import ExternalShutdownException
 
 from geometry_msgs.msg import TwistStamped, PoseArray
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Empty, String, Bool
+from sensor_msgs.msg import LaserScan, BatteryState
+from std_msgs.msg import Empty, String, Bool, Int32
+from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from rclpy.time import Time
 import tf2_ros
@@ -97,6 +98,22 @@ class RowFollower3T(Node):
         wm.path_wp_tol = float(self.get_parameter("path_wp_tol").value)
         wm.path_lookahead = int(self.get_parameter("path_lookahead").value)
 
+        # Pause/resume + bag (0 = off) and battery safety (opt-in).
+        self.declare_parameter("bag", 0)
+        self.declare_parameter("resume_headland_margin", 0.40)
+        self.declare_parameter("resume_wp_tol", 0.15)
+        self.declare_parameter("resume_max_duration", 90.0)
+        wm.bag = int(self.get_parameter("bag").value)
+        wm.resume_headland_margin = float(self.get_parameter("resume_headland_margin").value)
+        wm.resume_wp_tol = float(self.get_parameter("resume_wp_tol").value)
+        wm.resume_max_duration = float(self.get_parameter("resume_max_duration").value)
+        self.declare_parameter("battery_safety", False)
+        self.declare_parameter("battery_min_voltage", 10.0)
+        self.declare_parameter("battery_low_duration", 5.0)
+        wm.battery_safety = bool(self.get_parameter("battery_safety").value)
+        wm.battery_min_voltage = float(self.get_parameter("battery_min_voltage").value)
+        wm.battery_low_duration = float(self.get_parameter("battery_low_duration").value)
+
         self.declare_parameter("tree_max_range", 1.20)
         wm.tree_max_range = float(self.get_parameter("tree_max_range").value)
 
@@ -118,7 +135,7 @@ class RowFollower3T(Node):
         nominal_omega = wm.arc_linear_speed / wm.arc_radius
         wm.arc_max_duration = wm.arc_max_yaw / nominal_omega + 5.0
 
-        self.declare_parameter("avoid_front_distance", 0.28)
+        self.declare_parameter("avoid_front_distance", 0.35)
         wm.avoid_front_distance = float(self.get_parameter("avoid_front_distance").value)
 
         self.declare_parameter("return_home_enabled", True)
@@ -137,6 +154,9 @@ class RowFollower3T(Node):
         # ---- Publishers -----------------------------------------------------
         self.cmd_pub = self.create_publisher(TwistStamped, "/cmd_vel_nav", 10)
         self.status_pub = self.create_publisher(String, "/snc_status", 10)
+        # RViz-only: the tree clusters THIS follower perceives from /scan, so they
+        # can be eyeballed against tree_mapper's /trees. Separate topic/list.
+        self.tree_marker_pub = self.create_publisher(MarkerArray, "/row_follower/trees", 10)
         _enable_qos = QoSProfile(depth=1)
         _enable_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         _enable_qos.history = HistoryPolicy.KEEP_LAST
@@ -152,6 +172,7 @@ class RowFollower3T(Node):
         self.delib = Deliberator(wm, self, self.seq)
         self.seq.deliberator = self.delib
         self.skills.enter_avoid = self.seq.enter_avoid_front
+        self.delib.skills = self.skills   # row geometry for the re-sweep collection
 
         # ---- Subscribers ----------------------------------------------------
         self.create_subscription(LaserScan, "/scan", self.scan_callback, 10)
@@ -159,6 +180,13 @@ class RowFollower3T(Node):
         self.create_subscription(Empty, "/sweep_start", self.start_callback, 10)
         self.create_subscription(Empty, "/sweep_stop", self.stop_callback, 10)
         self.create_subscription(Empty, "/return_home", self.return_home_callback, 10)
+        # Pause/resume: park at home on pause, skip back to the paused row on resume.
+        self.create_subscription(Empty, "/pause_collection", self.pause_callback, 10)
+        self.create_subscription(Empty, "/resume_collection", self.resume_callback, 10)
+        self.create_subscription(
+            Int32, "/nuts/collected_count", self.collected_count_callback, _enable_qos)
+        # Battery safety (opt-in): pause + return home when voltage stays low.
+        self.create_subscription(BatteryState, "/battery", self.battery_callback, 10)
 
         latched = QoSProfile(depth=1)
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -177,8 +205,12 @@ class RowFollower3T(Node):
         wm.avoid_phase_start_time = now
 
         self.timer = self.create_timer(0.1, self.control_loop)
+        # RViz-only tree viz at 5 Hz (runs even before /sweep_start so the
+        # operator can see what the follower perceives while placing rows).
+        self.create_timer(0.2, self._publish_perceived_trees)
 
         self.publish_status("Simple row follower ready. Publish /sweep_start to begin.")
+        batt = (f"ON @{wm.battery_min_voltage:.1f}V" if wm.battery_safety else "off")
         self.get_logger().info(
             f"Ready (3T, multi-row). CLEAR={wm.clear_end_distance:.2f}m, "
             f"ARC r={wm.arc_radius:.2f}m v={wm.arc_linear_speed:.2f}m/s, "
@@ -187,7 +219,9 @@ class RowFollower3T(Node):
             f"row_group_gap={wm.row_group_gap:.2f}m, "
             f"lidar_yaw_offset={math.degrees(wm.lidar_yaw_offset):+.0f}deg, "
             f"return_home={wm.return_home_enabled}, manual_topic=/return_home, "
-            f"avoid_front={wm.avoid_front_distance:.2f}m"
+            f"avoid_front={wm.avoid_front_distance:.2f}m, "
+            f"bag={wm.bag or 'off'}, pause=/pause_collection, resume=/resume_collection, "
+            f"battery_safety={batt}"
         )
 
     # -----------------------------
@@ -216,8 +250,76 @@ class RowFollower3T(Node):
     def return_home_callback(self, _msg: Empty):
         self.delib.on_return_home()
 
+    def pause_callback(self, _msg: Empty):
+        self.delib.on_pause()
+
+    def resume_callback(self, _msg: Empty):
+        self.delib.on_resume()
+
+    def collected_count_callback(self, msg: Int32):
+        self.wm._collected_total = int(msg.data)
+
+    def battery_callback(self, msg: BatteryState):
+        self.wm._battery_voltage = float(msg.voltage)
+
     def control_loop(self):
         self.seq.tick()
+
+    def _publish_perceived_trees(self):
+        """RViz-only: publish the tree clusters the follower currently sees from
+        /scan, transformed to the MAP frame (falls back to odom if no map TF).
+        Read-only - re-runs the existing clustering + a coordinate transform,
+        never touches navigation state."""
+        wm = self.wm
+        if wm.latest_scan is None or wm.odom_x is None or wm.odom_yaw is None:
+            return
+        # Both side cones merged + re-sorted by angle so the front overlap
+        # collapses into single clusters (full -170..+170 view). base_link frame.
+        pts = (self.perc.collect_row_side_points("right")
+               + self.perc.collect_row_side_points("left"))
+        pts.sort(key=lambda p: p[2])
+        trees = self.perc.cluster_to_trees(pts)
+
+        # base_link -> odom (via the robot's odom pose), then odom -> map (the
+        # inverse of map_to_odom's odom<-map). Publish at those fixed positions.
+        m2o = self.map_to_odom()            # (tx,ty,c,s) for odom<-map, or None
+        frame = "map" if m2o is not None else "odom"
+        cyaw, syaw = math.cos(wm.odom_yaw), math.sin(wm.odom_yaw)
+        placed = []
+        for (bx, by, _cnt) in trees:
+            ox = wm.odom_x + cyaw * bx - syaw * by
+            oy = wm.odom_y + syaw * bx + cyaw * by
+            if m2o is not None:
+                tx, ty, c, s = m2o
+                dx, dy = ox - tx, oy - ty
+                placed.append((c * dx + s * dy, -s * dx + c * dy))   # map<-odom
+            else:
+                placed.append((ox, oy))
+
+        arr = MarkerArray()
+        clear = Marker()
+        clear.header.frame_id = frame
+        clear.action = Marker.DELETEALL
+        arr.markers.append(clear)
+        stamp = self.get_clock().now().to_msg()
+        for i, (mx, my) in enumerate(placed):
+            mk = Marker()
+            mk.header.frame_id = frame
+            mk.header.stamp = stamp
+            mk.ns = "follower_trees"
+            mk.id = i
+            mk.type = Marker.CYLINDER
+            mk.action = Marker.ADD
+            mk.pose.position.x = float(mx)
+            mk.pose.position.y = float(my)
+            mk.pose.position.z = 0.15
+            mk.pose.orientation.w = 1.0
+            mk.scale.x = mk.scale.y = 0.10
+            mk.scale.z = 0.30
+            mk.color.r, mk.color.g, mk.color.b = 0.1, 0.6, 1.0   # cyan (vs tree_mapper)
+            mk.color.a = 0.9
+            arr.markers.append(mk)
+        self.tree_marker_pub.publish(arr)
 
     # -----------------------------
     # io interface used by every tier
@@ -233,6 +335,9 @@ class RowFollower3T(Node):
 
     def log_warn(self, text: str):
         self.get_logger().warn(text)
+
+    def log_error(self, text: str):
+        self.get_logger().error(text)
 
     def publish_status(self, text: str):
         m = String()

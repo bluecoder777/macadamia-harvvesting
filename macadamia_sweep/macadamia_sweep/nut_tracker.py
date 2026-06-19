@@ -25,7 +25,9 @@ Subscribes:
 
 Publishes:
     /nuts/markers           visualization_msgs/MarkerArray   spheres + count
+    /nuts/zones             visualization_msgs/MarkerArray   nut_zone_radius discs
     /nuts/uncollected       geometry_msgs/PoseArray (latched) for the picker
+    /nuts/collected_count   std_msgs/Int32 (latched)   running collected total
     /snc_status             std_msgs/String   "Nuts: collected X / total Y"
 
 Run:
@@ -45,7 +47,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from rclpy.executors import ExternalShutdownException
 
 from geometry_msgs.msg import PoseArray, Pose
-from std_msgs.msg import String
+from std_msgs.msg import String, Int32
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -102,6 +104,9 @@ class NutTracker(Node):
         # ---- Visualisation ----
         self.declare_parameter("marker_diameter", 0.08)   # bigger than 3 cm so it's visible
         self.declare_parameter("marker_namespace", "nuts")
+        # RViz-only ring radius drawn around each nut (matches tree_gate_radius:
+        # a nut is valid if a tree is within this distance). 0.50 m = "50 cm".
+        self.declare_parameter("nut_zone_radius", 0.50)
 
         # ---- Persistence ----
         self.declare_parameter(
@@ -120,6 +125,7 @@ class NutTracker(Node):
         self.sweep_side = str(self.get_parameter("sweep_side").value).lower()
         self.marker_diameter = float(self.get_parameter("marker_diameter").value)
         self.marker_ns = self.get_parameter("marker_namespace").value
+        self.nut_zone_radius = float(self.get_parameter("nut_zone_radius").value)
         self.save_path = self.get_parameter("save_path").value
 
         # ---- State ----
@@ -133,6 +139,8 @@ class NutTracker(Node):
 
         # ---- Pub / Sub ----
         self.marker_pub = self.create_publisher(MarkerArray, "/nuts/markers", 10)
+        # Separate (toggleable) list: a nut_zone_radius disc around each nut.
+        self.zone_pub = self.create_publisher(MarkerArray, "/nuts/zones", 10)
         self.status_pub = self.create_publisher(String, "/snc_status", 10)
         # Latched so a picker node that starts LATER still receives the list.
         latched = QoSProfile(depth=1)
@@ -141,6 +149,10 @@ class NutTracker(Node):
         self.uncollected_pub = self.create_publisher(
             PoseArray, "/nuts/uncollected", latched
         )
+        # Running count of collected nuts (latched, so a follower that starts or
+        # re-subscribes later still gets the current total). Drives the row
+        # follower's "bag" auto-pause.
+        self.count_pub = self.create_publisher(Int32, "/nuts/collected_count", latched)
 
         self.create_subscription(
             PoseArray, "/nuts/detections", self.detections_callback, 10
@@ -284,6 +296,7 @@ class NutTracker(Node):
         m = String()
         m.data = f"Nuts: collected {collected} / total {len(conf)}"
         self.status_pub.publish(m)
+        self.count_pub.publish(Int32(data=collected))
 
     def publish_uncollected(self):
         conf = self.confirmed()
@@ -341,6 +354,31 @@ class NutTracker(Node):
         arr.markers.append(txt)
 
         self.marker_pub.publish(arr)
+
+        # Separate list: the "50 cm from the nut" zone as a flat translucent disc.
+        zones = MarkerArray()
+        zclear = Marker()
+        zclear.header.frame_id = self.map_frame
+        zclear.action = Marker.DELETEALL
+        zones.markers.append(zclear)
+        for n in conf:
+            z = Marker()
+            z.header.frame_id = self.map_frame
+            z.header.stamp = self.get_clock().now().to_msg()
+            z.ns = "nut_zone"
+            z.id = n.id
+            z.type = Marker.CYLINDER
+            z.action = Marker.ADD
+            z.pose.position.x = n.x
+            z.pose.position.y = n.y
+            z.pose.position.z = 0.01
+            z.pose.orientation.w = 1.0
+            z.scale.x = z.scale.y = 2.0 * self.nut_zone_radius   # diameter
+            z.scale.z = 0.02
+            z.color.r, z.color.g, z.color.b = 1.0, 0.9, 0.1      # yellow
+            z.color.a = 0.15
+            zones.markers.append(z)
+        self.zone_pub.publish(zones)
 
     # -----------------------------
     # Persistence

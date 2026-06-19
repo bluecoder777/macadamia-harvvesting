@@ -79,6 +79,15 @@ class Sequencer:
         if wm._strafe_next_state == "FOLLOW_BACK":
             self._enter_follow_back(f"{why}. Sweeping back.")
         else:
+            # Outbound pass starting here: record the row's start (for a pause to
+            # skip back to on resume). Append to the per-row anchor list ONLY for a
+            # brand-new forward row (len == rows_completed); resume/recollect
+            # re-sweeps an already-recorded row, so the guard skips them.
+            if wm.odom_x is not None:
+                wm._row_start_anchor = (wm.odom_x, wm.odom_y)
+                if len(wm._row_anchors) == wm.rows_completed:
+                    wm._row_anchors.append(
+                        (wm.odom_x, wm.odom_y, wm.current_side))
             self.set_state(Skill.FOLLOW_OUT, f"{why}. Sweeping row.")
 
     def _begin_next_row(self, status: str):
@@ -115,6 +124,8 @@ class Sequencer:
         if not wm.started:
             self.io.stop_robot()
             return
+        # Battery safety runs before everything else - it may pause this tick.
+        self.deliberator.battery_safety_check()
         if wm.latest_scan is None:
             self.io.stop_robot()
             self.io.publish_status("Waiting for /scan")
@@ -137,10 +148,13 @@ class Sequencer:
                 f"Lazy home saved: x={wm.home_x:+.2f}, y={wm.home_y:+.2f}, "
                 f"yaw={math.degrees(wm.home_yaw or 0.0):+.1f}deg"
             )
+            if not wm._row_anchors:           # row 0 start (odom was late at start)
+                wm._row_anchors = [(wm.home_x, wm.home_y, wm.current_side)]
 
         # Record swept free-space while actively sweeping.
         if wm.state in wm._SWEEP_STATES:
             self.skills.update_swept_bounds()
+            self.deliberator.bag_and_resume_tick()
 
         if wm.state == Skill.FOLLOW_OUT:
             self._tick_follow_out()
@@ -164,6 +178,15 @@ class Sequencer:
             self._tick_collect_nuts()
         elif wm.state == Skill.RETURN_HOME:
             self._tick_return_home()
+        elif wm.state == Skill.RESUME_NAV:
+            self._tick_resume_nav()
+        elif wm.state == Skill.PAUSED:
+            self.io.stop_robot()
+            self.io.publish_status(
+                f"PAUSED at home after row {wm._pause_row + 1} - "
+                f"publish /resume_collection to continue."
+            )
+            return
         elif wm.state == Skill.DONE:
             self.io.stop_robot()
             wm.started = False
@@ -272,6 +295,10 @@ class Sequencer:
                     else f"timeout/lost (along={along}, "
                          f"elapsed={self.elapsed_in_state():.1f}s)")
             self.io.log_warn(f"FOLLOW_BACK end: {_why}")
+            if wm._recollecting:
+                # Re-sweep pass done: on to the next missed row (or home).
+                self.deliberator._recollect_next("Re-swept a row for missed nuts.")
+                return
             self.deliberator.after_row_pass(opp)
             return
 
@@ -307,4 +334,44 @@ class Sequencer:
             # return_home handed off to AVOID_FRONT.
             return
         if ev == Event.HOME_REACHED:
+            # Aborted return (timeout / no home): always finish.
             self.set_state(Skill.DONE, status)
+        elif ev == Event.RETURN_FINISHED:
+            # Reached start: hand off to the pause-aware end state (DONE / PAUSED).
+            self._finish_return(status)
+
+    def _finish_return(self, reason: str):
+        """RETURN_HOME completion hand-off: PAUSED if a pause is active, else DONE."""
+        self.io.stop_robot()
+        self.set_state(self.wm._return_end_state, reason)
+
+    # -----------------------------
+    # RESUME_NAV
+    # -----------------------------
+    def _tick_resume_nav(self):
+        wm = self.wm
+        ev, reason = self.skills.resume_nav()
+        if wm.state != Skill.RESUME_NAV:
+            # a drive leg handed off to AVOID_FRONT.
+            return
+        if ev == Event.RESUME_DONE:
+            self._resume_start_sweep(reason)
+
+    def _resume_start_sweep(self, reason: str):
+        """Restore the paused row's bookkeeping and re-enter the sweep via the
+        crab (heading already aligned; crab does the lateral re-align to 0.40 m)."""
+        wm = self.wm
+        wm.rows_completed = wm._pause_row
+        wm.current_side = wm._pause_side
+        wm.seen_row_this_pass = False
+        wm.passed_forward_tree = False
+        wm.next_row_hits = 0
+        wm.clear_start_x = None
+        wm.clear_start_y = None
+        wm.arc_start_yaw = None
+        wm.arc_last_yaw = None
+        wm.arc_accumulated_yaw = 0.0
+        self._enter_strafe(
+            Skill.FOLLOW_OUT,
+            f"{reason}. Re-aligning; detection off until the pause spot."
+        )
