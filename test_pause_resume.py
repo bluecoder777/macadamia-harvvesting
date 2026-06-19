@@ -63,6 +63,9 @@ for _n in ("Empty", "String", "Bool", "Int32"):
 tf2 = _mod("tf2_ros")
 tf2.Buffer = type("Buffer", (), {})
 tf2.TransformListener = type("TransformListener", (), {})
+vis = _mod("visualization_msgs.msg")
+for _n in ("Marker", "MarkerArray"):
+    setattr(vis, _n, type(_n, (), {}))
 
 sys.path.insert(0, "macadamia_sweep")
 from macadamia_sweep import simple_row_follower as SRF  # noqa: E402

@@ -11,6 +11,7 @@ from geometry_msgs.msg import TwistStamped, PoseArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan, BatteryState
 from std_msgs.msg import Empty, String, Bool, Int32
+from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from rclpy.time import Time
 import tf2_ros
@@ -78,6 +79,9 @@ class SimpleRowFollower(Node):
 
         self.cmd_pub = self.create_publisher(TwistStamped, "/cmd_vel_nav", 10)
         self.status_pub = self.create_publisher(String, "/snc_status", 10)
+        # RViz-only: the tree clusters THIS follower perceives from /scan, so they
+        # can be eyeballed against tree_mapper's /trees. Separate topic/list.
+        self.tree_marker_pub = self.create_publisher(MarkerArray, "/row_follower/trees", 10)
         # Tells the perception nodes to run (True) or hold (False). Perception is
         # on during the sweep and off from missed-nut collection onward (collect +
         # return), so the nut world model AND the tree map are frozen while the
@@ -489,6 +493,9 @@ class SimpleRowFollower(Node):
         self.avoid_phase_start_time = self.get_clock().now()
 
         self.timer = self.create_timer(0.1, self.control_loop)
+        # RViz-only tree viz at 5 Hz (runs even before /sweep_start so the
+        # operator can see what the follower perceives while placing rows).
+        self.create_timer(0.2, self._publish_perceived_trees)
 
         self.publish_status("Simple row follower ready. Publish /sweep_start to begin.")
         batt = (f"ON @{self.battery_min_voltage:.1f}V" if self.battery_safety else "off")
@@ -875,6 +882,62 @@ class SimpleRowFollower(Node):
             my = sum(ys) / len(ys)
             trees.append((mx, my, len(c)))
         return trees
+
+    def _publish_perceived_trees(self):
+        """RViz-only: publish the tree clusters the follower currently sees from
+        /scan, transformed to the MAP frame so each sits at its true location in
+        the map (not relative to the robot). Falls back to the odom frame if the
+        map TF isn't available yet. Read-only - it just re-runs the existing
+        clustering and a coordinate transform, never touches navigation state."""
+        if self.latest_scan is None or self.odom_x is None or self.odom_yaw is None:
+            return
+        # Both side cones merged + re-sorted by angle so the front overlap
+        # collapses into single clusters (full -170..+170 view). base_link frame.
+        pts = (self.collect_row_side_points("right")
+               + self.collect_row_side_points("left"))
+        pts.sort(key=lambda p: p[2])
+        trees = self.cluster_to_trees(pts)
+
+        # base_link -> odom (via the robot's odom pose), then odom -> map (the
+        # inverse of _map_to_odom's odom<-map). Publish at those fixed positions.
+        m2o = self._map_to_odom()           # (tx,ty,c,s) for odom<-map, or None
+        frame = "map" if m2o is not None else "odom"
+        cyaw, syaw = math.cos(self.odom_yaw), math.sin(self.odom_yaw)
+        placed = []
+        for (bx, by, _cnt) in trees:
+            ox = self.odom_x + cyaw * bx - syaw * by
+            oy = self.odom_y + syaw * bx + cyaw * by
+            if m2o is not None:
+                tx, ty, c, s = m2o
+                dx, dy = ox - tx, oy - ty
+                placed.append((c * dx + s * dy, -s * dx + c * dy))   # map<-odom
+            else:
+                placed.append((ox, oy))
+
+        arr = MarkerArray()
+        clear = Marker()
+        clear.header.frame_id = frame
+        clear.action = Marker.DELETEALL
+        arr.markers.append(clear)
+        stamp = self.get_clock().now().to_msg()
+        for i, (mx, my) in enumerate(placed):
+            mk = Marker()
+            mk.header.frame_id = frame
+            mk.header.stamp = stamp
+            mk.ns = "follower_trees"
+            mk.id = i
+            mk.type = Marker.CYLINDER
+            mk.action = Marker.ADD
+            mk.pose.position.x = float(mx)
+            mk.pose.position.y = float(my)
+            mk.pose.position.z = 0.15
+            mk.pose.orientation.w = 1.0
+            mk.scale.x = mk.scale.y = 0.10
+            mk.scale.z = 0.30
+            mk.color.r, mk.color.g, mk.color.b = 0.1, 0.6, 1.0   # cyan (vs tree_mapper)
+            mk.color.a = 0.9
+            arr.markers.append(mk)
+        self.tree_marker_pub.publish(arr)
 
     @staticmethod
     def opposite(side: str) -> str:

@@ -111,7 +111,7 @@ class _Scale:
     def __init__(self):
         self.x = self.y = self.z = 0.0
 class _Marker:
-    SPHERE = 2; ADD = 0; TEXT_VIEW_FACING = 9
+    SPHERE = 2; ADD = 0; TEXT_VIEW_FACING = 9; CYLINDER = 3; DELETEALL = 3
     def __init__(self):
         self.header = _Header(); self.ns = ""; self.id = 0; self.type = 0
         self.action = 0; self.pose = _Pose(); self.scale = _Scale()
@@ -326,7 +326,7 @@ def make_tracker():
     t.nuts = []; t.next_id = 0
     t.merge_radius = 0.15; t.min_hits = 3; t.collection_radius = 0.25
     t.map_frame = "map"; t.robot_frame = "base_link"
-    t.marker_ns = "nuts"; t.marker_diameter = 0.08
+    t.marker_ns = "nuts"; t.marker_diameter = 0.08; t.nut_zone_radius = 0.50
     t.use_tree_gate = False; t.tree_gate_radius = 0.50; t.tree_pts = []
     t.sweep_offset = 0.40; t.sweep_side = "right"
     return t
@@ -390,7 +390,7 @@ class _TF:
 trk.get_clock = lambda: _Clk()
 trk.get_logger = lambda: _Log()
 trk.uncollected_pub = _Pub(); trk.status_pub = _Pub(); trk.marker_pub = _Pub()
-trk.count_pub = _Pub()
+trk.count_pub = _Pub(); trk.zone_pub = _Pub()
 # The sweeper is offset 0.40 m to the hug side (right). With yaw=0 the sweeper
 # sits at (rx, ry-0.40), so to drive the sweeper onto nut #0 (~1.02,1.00) the
 # robot body must be at (1.02, 1.40).
@@ -417,7 +417,7 @@ trk2 = make_tracker()
 trk2.get_clock = lambda: _Clk()
 trk2.get_logger = lambda: _Log()
 trk2.uncollected_pub = _Pub(); trk2.status_pub = _Pub(); trk2.marker_pub = _Pub()
-trk2.count_pub = _Pub()
+trk2.count_pub = _Pub(); trk2.zone_pub = _Pub()
 for _ in range(3):
     trk2.associate(3.00, 3.00)   # confirm a nut under the robot centre
 trk2.tf_buffer = _TF(3.00, 3.00)
