@@ -81,7 +81,16 @@ class SimpleRowFollower(Node):
         self.status_pub = self.create_publisher(String, "/snc_status", 10)
         # RViz-only: the tree clusters THIS follower perceives from /scan, so they
         # can be eyeballed against tree_mapper's /trees. Separate topic/list.
+        # The markers PERSIST (accumulate) instead of vanishing each tick: every
+        # detection is merged into a running list (in the ODOM frame, which is
+        # smooth - so the same tree re-seen from a new pose folds into one marker
+        # instead of leaving a ghost; RViz still draws them at their map place).
         self.tree_marker_pub = self.create_publisher(MarkerArray, "/row_follower/trees", 10)
+        self.declare_parameter("tree_viz_merge_radius", 0.20)  # m, dedup re-sightings
+        self.declare_parameter("tree_viz_min_hits", 2)         # hide 1-frame phantoms
+        self.tree_viz_merge_radius = float(self.get_parameter("tree_viz_merge_radius").value)
+        self.tree_viz_min_hits = int(self.get_parameter("tree_viz_min_hits").value)
+        self._seen_trees: List[List[float]] = []   # persistent [x, y, hits] in odom
         # Tells the perception nodes to run (True) or hold (False). Perception is
         # on during the sweep and off from missed-nut collection onward (collect +
         # return), so the nut world model AND the tree map are frozen while the
@@ -558,6 +567,14 @@ class SimpleRowFollower(Node):
         self._swept_path = []
         self._swept_long_min = self._swept_long_max = None
         self._swept_lat_min = self._swept_lat_max = None
+        # Fresh run: clear the accumulated tree markers (and wipe them in RViz).
+        self._seen_trees = []
+        _clr = MarkerArray()
+        _m = Marker()
+        _m.header.frame_id = "odom"
+        _m.action = Marker.DELETEALL
+        _clr.markers.append(_m)
+        self.tree_marker_pub.publish(_clr)
         # Fresh run: clear any pause/resume/recollect state and start a new bag.
         self._paused = False
         self._resuming = False
@@ -884,11 +901,14 @@ class SimpleRowFollower(Node):
         return trees
 
     def _publish_perceived_trees(self):
-        """RViz-only: publish the tree clusters the follower currently sees from
-        /scan, transformed to the MAP frame so each sits at its true location in
-        the map (not relative to the robot). Falls back to the odom frame if the
-        map TF isn't available yet. Read-only - it just re-runs the existing
-        clustering and a coordinate transform, never touches navigation state."""
+        """RViz-only: ACCUMULATE the tree clusters the follower sees from /scan
+        into a persistent, de-duplicated list so the markers stay put instead of
+        vanishing each tick. Each detection is mapped to the odom frame (smooth,
+        always available) and merged into the nearest stored tree within
+        tree_viz_merge_radius - so re-seeing the same tree from a new pose folds
+        into ONE marker, not a ghost. Only trees confirmed by >= tree_viz_min_hits
+        sightings are drawn (drops 1-frame phantoms). Read-only: it re-runs the
+        existing clustering and never touches navigation state."""
         if self.latest_scan is None or self.odom_x is None or self.odom_yaw is None:
             return
         # Both side cones merged + re-sorted by angle so the front overlap
@@ -898,38 +918,42 @@ class SimpleRowFollower(Node):
         pts.sort(key=lambda p: p[2])
         trees = self.cluster_to_trees(pts)
 
-        # base_link -> odom (via the robot's odom pose), then odom -> map (the
-        # inverse of _map_to_odom's odom<-map). Publish at those fixed positions.
-        m2o = self._map_to_odom()           # (tx,ty,c,s) for odom<-map, or None
-        frame = "map" if m2o is not None else "odom"
+        # Fold this tick's detections into the persistent odom-frame list.
         cyaw, syaw = math.cos(self.odom_yaw), math.sin(self.odom_yaw)
-        placed = []
+        r2 = self.tree_viz_merge_radius ** 2
         for (bx, by, _cnt) in trees:
             ox = self.odom_x + cyaw * bx - syaw * by
             oy = self.odom_y + syaw * bx + cyaw * by
-            if m2o is not None:
-                tx, ty, c, s = m2o
-                dx, dy = ox - tx, oy - ty
-                placed.append((c * dx + s * dy, -s * dx + c * dy))   # map<-odom
+            best, best_d2 = None, r2
+            for t in self._seen_trees:
+                d2 = (t[0] - ox) ** 2 + (t[1] - oy) ** 2
+                if d2 < best_d2:
+                    best, best_d2 = t, d2
+            if best is None:
+                self._seen_trees.append([ox, oy, 1])
             else:
-                placed.append((ox, oy))
+                n = best[2]                         # running average + 1 hit
+                best[0] = (best[0] * n + ox) / (n + 1)
+                best[1] = (best[1] * n + oy) / (n + 1)
+                best[2] = n + 1
 
+        # Draw the confirmed trees (stable ids => they persist in RViz; ADD just
+        # refines the position of one already shown). odom frame -> RViz places
+        # them at their map location and self-corrects with SLAM.
         arr = MarkerArray()
-        clear = Marker()
-        clear.header.frame_id = frame
-        clear.action = Marker.DELETEALL
-        arr.markers.append(clear)
         stamp = self.get_clock().now().to_msg()
-        for i, (mx, my) in enumerate(placed):
+        for i, (tx, ty, hits) in enumerate(self._seen_trees):
+            if hits < self.tree_viz_min_hits:
+                continue
             mk = Marker()
-            mk.header.frame_id = frame
+            mk.header.frame_id = "odom"
             mk.header.stamp = stamp
             mk.ns = "follower_trees"
             mk.id = i
             mk.type = Marker.CYLINDER
             mk.action = Marker.ADD
-            mk.pose.position.x = float(mx)
-            mk.pose.position.y = float(my)
+            mk.pose.position.x = float(tx)
+            mk.pose.position.y = float(ty)
             mk.pose.position.z = 0.15
             mk.pose.orientation.w = 1.0
             mk.scale.x = mk.scale.y = 0.10
@@ -937,7 +961,8 @@ class SimpleRowFollower(Node):
             mk.color.r, mk.color.g, mk.color.b = 0.1, 0.6, 1.0   # cyan (vs tree_mapper)
             mk.color.a = 0.9
             arr.markers.append(mk)
-        self.tree_marker_pub.publish(arr)
+        if arr.markers:
+            self.tree_marker_pub.publish(arr)
 
     @staticmethod
     def opposite(side: str) -> str:
