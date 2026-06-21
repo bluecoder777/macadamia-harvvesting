@@ -1,0 +1,34 @@
+from setuptools import setup
+import os
+from glob import glob
+
+package_name = "macadamia_sweep"
+
+setup(
+    name=package_name,
+    version="0.0.0",
+    packages=[package_name, package_name + ".three_tier"],
+    data_files=[
+        ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
+        ("share/" + package_name, ["package.xml"]),
+        (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
+        (os.path.join("share", package_name, "worlds"), glob("worlds/*.world")),
+        (os.path.join("share", package_name, "rviz"), glob("rviz/*.rviz")),
+    ],
+    install_requires=["setuptools"],
+    zip_safe=True,
+    maintainer="user",
+    maintainer_email="user@example.com",
+    description="Simple single-row macadamia/chestnut demo",
+    license="MIT",
+    entry_points={
+        'console_scripts': [
+    'row_follower_3t = macadamia_sweep.three_tier.agent:main',
+    'sweep_logger = macadamia_sweep.sweep_logger:main',
+    'mission_summary_logger = macadamia_sweep.mission_summary_logger:main',
+    'nut_detector = macadamia_sweep.nut_detector:main',
+    'nut_tracker = macadamia_sweep.nut_tracker:main',
+    'tree_mapper = macadamia_sweep.tree_mapper:main',
+],
+    },
+)
