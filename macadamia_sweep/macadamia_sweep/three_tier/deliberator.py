@@ -11,8 +11,7 @@ rather than the immediate control loop:
     and finishing.
 
 It writes its decisions into the world model and hands the sequencer the next
-goal-state. All numeric/logic content is a verbatim port of the original
-callbacks and the ``finish_or_return_home`` / ``_go_home`` helpers.
+goal-state.
 """
 
 import math
@@ -150,7 +149,7 @@ class Deliberator:
     # -----------------------------
     def after_row_pass(self, opp: str):
         """Decide what happens after a finished return pass: sweep the next row,
-        collect nuts, or go home. Verbatim port of the FOLLOW_BACK-end block."""
+        collect nuts, or go home."""
         wm = self.wm
         wm.rows_completed += 1
         next_row_seen = wm.next_row_hits >= wm.next_row_min_hits

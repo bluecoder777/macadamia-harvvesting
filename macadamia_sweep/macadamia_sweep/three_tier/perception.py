@@ -5,7 +5,7 @@ Pure functions of the cached LiDAR scan + odom + parameters in the world
 model. They turn raw sensor data into the percepts the skills use to steer and
 the events the sequencer uses to decide transitions (row line fit, front
 distance, "last tree abeam", next-row visibility). No actuation, no state
-changes -- every method is a verbatim port of the original perception code.
+changes -- recognition only.
 """
 
 import math

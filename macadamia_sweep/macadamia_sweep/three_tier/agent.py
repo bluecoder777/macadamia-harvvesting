@@ -8,9 +8,10 @@ actuation, timing, logging, perception enable and TF lookups. Once per 10 Hz
 timer cycle it ticks the executive (``Sequencer.tick``), which in turn drives
 the active skill and, at mission forks, the Deliberator.
 
-The ROS surface (topics, QoS, parameters, the 0.1 s timer and the published
-status text) is identical to the original ``simple_row_follower`` node, so the
-rest of the system (perception nodes, RViz, operator triggers) is unaffected.
+The node publishes velocity on /cmd_vel_nav and status on /snc_status, drives
+the perception-enable topics, and listens on the sweep/return/pause/resume
+triggers -- the rest of the system (perception nodes, RViz, operator triggers)
+talks to it through those topics alone.
 """
 
 import math
@@ -43,7 +44,7 @@ class RowFollower3T(Node):
         self.wm = WorldModel()
         wm = self.wm
 
-        # ---- Parameters (declared + read exactly as the original node) ------
+        # ---- Parameters -----------------------------------------------------
         self.declare_parameter("start_side", "right")
         wm.start_side = str(self.get_parameter("start_side").value).lower()
         if wm.start_side not in ("right", "left"):
@@ -131,7 +132,7 @@ class RowFollower3T(Node):
 
         self.declare_parameter("arc_radius", 0.40)
         wm.arc_radius = float(self.get_parameter("arc_radius").value)
-        # Derived from arc params (mirrors the original computation).
+        # Open-loop arc duration cap derived from the arc speed/radius.
         nominal_omega = wm.arc_linear_speed / wm.arc_radius
         wm.arc_max_duration = wm.arc_max_yaw / nominal_omega + 5.0
 

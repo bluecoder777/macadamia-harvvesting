@@ -7,13 +7,11 @@ exactly one velocity command (and its own running status), and returns an
 ``(event, status)`` outcome telling the sequencer whether it is still RUNNING or
 has completed/aborted. Skills NEVER decide what runs next -- with a single
 deliberate exception: the front-avoidance safety reflex, which a skill triggers
-through the sequencer-provided ``enter_avoid`` callback so that the original
-intra-tick ordering of published commands/status is preserved bit-for-bit.
+through the sequencer-provided ``enter_avoid`` callback.
 
-Every numeric computation here is a verbatim port of the original
-``SimpleRowFollower`` skill methods; only ``self.<x>`` accesses were rehomed to
-``self.wm`` (state/params), ``self.io`` (ROS actuation/clock) and ``self.perc``
-(perception), and ``set_state(...)`` calls were replaced by the outcome return.
+Each skill reads state/params from ``self.wm`` (world model), actuates and reads
+the clock through ``self.io``, and queries ``self.perc`` (perception); it never
+sets the executive state itself, signalling completion via the outcome return.
 """
 
 import math
@@ -33,7 +31,7 @@ class Skills:
         # Wired by the agent after the sequencer exists. Signature: (reason:str).
         self.enter_avoid = None
 
-    # ---- small timing/percept helpers (verbatim semantics) --------------
+    # ---- small timing/percept helpers -----------------------------------
     def _elapsed_in_state(self) -> float:
         return self.io.elapsed_since(self.wm.state_start_time)
 
@@ -115,8 +113,8 @@ class Skills:
     # -----------------------------
     def clear_straight(self, next_state: str, label: str):
         """Drive straight until clear_end_distance past the row end, then report
-        DONE. next_state/label are supplied by the sequencer purely so the status
-        text matches the original verbatim."""
+        DONE. next_state/label are supplied by the sequencer so the published
+        status names the upcoming transition."""
         wm = self.wm
         front = self.perc.get_front_distance()
         if front < wm.emergency_stop_distance:
@@ -534,7 +532,7 @@ class Skills:
                         f"Robot stopped.")
             return RUNNING
 
-        # At x/y start. Rotate back to the original start heading if known.
+        # At x/y start. Rotate back to the saved start heading if known.
         if wm.home_yaw is not None:
             yaw_error = normalize_angle(wm.home_yaw - wm.odom_yaw)
             if abs(yaw_error) > wm.return_yaw_tolerance:
@@ -621,7 +619,7 @@ class Skills:
         return RUNNING
 
     # -----------------------------
-    # COLLECT_NUTS - tree-aware pickup helpers + skill (superseded by re-sweep)
+    # COLLECT_NUTS - tree-aware pickup helpers + skill
     # -----------------------------
     def _map_to_odom(self):
         return self.io.map_to_odom()

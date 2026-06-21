@@ -5,7 +5,7 @@ import math
 
 
 def normalize_angle(a: float) -> float:
-    """Wrap an angle to (-pi, pi]. Verbatim port of the original helper."""
+    """Wrap an angle to (-pi, pi]."""
     while a > math.pi:
         a -= 2.0 * math.pi
     while a < -math.pi:
@@ -20,9 +20,9 @@ def opposite(side: str) -> str:
 class Skill:
     """Names of the reactive skills (one is active at a time).
 
-    These double as the sequencer ``state`` strings, kept identical to the
-    original FSM state names so every published /snc_status message and the
-    swept-state membership test are byte-for-byte unchanged.
+    Each name doubles as the sequencer's ``state`` string and as the label
+    published on /snc_status, so the executive, the swept-state membership test
+    and the status feed all speak the same vocabulary.
     """
 
     WAITING = "WAITING"
@@ -35,7 +35,7 @@ class Skill:
     CLEAR_NEXT = "CLEAR_NEXT"
     TURN_NEXT = "TURN_NEXT"
     AVOID_FRONT = "AVOID_FRONT"
-    COLLECT_NUTS = "COLLECT_NUTS"   # superseded by re-sweep collection; never entered
+    COLLECT_NUTS = "COLLECT_NUTS"   # direct tree-aware nut pickup skill
     RETURN_HOME = "RETURN_HOME"
     RESUME_NAV = "RESUME_NAV"       # skip back to a paused/missed row and re-sweep it
     PAUSED = "PAUSED"               # parked at home, waiting for /resume_collection

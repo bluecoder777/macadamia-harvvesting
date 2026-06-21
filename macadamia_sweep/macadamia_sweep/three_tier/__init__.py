@@ -1,8 +1,7 @@
 """3T (three-tier) robot architecture for the macadamia single-row sweep.
 
-This package is a behaviour-preserving refactor of the original monolithic
-``simple_row_follower`` finite-state machine into the classic three-tier
-("3T") robot control architecture (Bonasso, Firby, Kortenkamp, Miller, Slack):
+The controller is organised as the classic three-tier ("3T") robot control
+architecture (Bonasso, Firby, Kortenkamp, Miller, Slack):
 
     Deliberator  (planner / mission tier)  -- deliberator.py
         Owns the mission plan and all long-horizon decisions: when to start,
@@ -31,10 +30,9 @@ This package is a behaviour-preserving refactor of the original monolithic
     Agent        (ROS node + wiring)       -- agent.py
         The thin ROS2 node: owns the publishers/subscribers/parameters/timer
         and the TF buffer, fills the world model from sensor callbacks, and
-        ticks Deliberator-input -> Sequencer -> Skill once per 10 Hz cycle in
-        exactly the order the original control loop used.
+        ticks Deliberator-input -> Sequencer -> Skill once per 10 Hz cycle.
 
-Behaviour is identical to the original FSM by construction: every numeric
-computation, threshold, gain and published status string is ported verbatim;
-only the *home* of each piece of logic moved between tiers.
+The clean tier split keeps each concern in one place: mission planning in the
+Deliberator, choreography in the Sequencer, and tight reactive control in the
+Skill layer, all coordinating through the shared world model.
 """

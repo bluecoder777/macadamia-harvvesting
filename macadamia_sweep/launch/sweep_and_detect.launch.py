@@ -1,7 +1,7 @@
 """One launch for the whole mission: sweep + nut detection + nut tracking.
 
 Brings up all three nodes together:
-  * simple_row_follower  -- drives the row sweep (waits for /sweep_start)
+  * row_follower_3t      -- drives the row sweep (waits for /sweep_start)
   * nut_detector         -- perception (runs continuously)
   * nut_tracker          -- world model + collected/uncollected markers
 

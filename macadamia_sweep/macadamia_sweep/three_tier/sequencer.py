@@ -8,11 +8,11 @@ sweep. At mission forks (end of a return pass, end of collection) it defers to
 the Deliberator. It also exposes ``enter_avoid_front`` -- the one reactive
 interrupt a skill may trigger -- and the small private transition helpers
 (``_enter_strafe`` / ``_enter_follow_back`` / ``_finish_strafe`` /
-``_begin_next_row``) ported verbatim from the original.
+``_begin_next_row``).
 
-``tick()`` reproduces the original ``control_loop`` byte-for-byte: same preamble
-(idle/scan guards, lazy heading anchor, lazy home, swept-bounds recording) and
-the same per-state dispatch and transition conditions.
+``tick()`` is the control cycle: a short preamble (idle/scan guards, lazy
+heading anchor, lazy home, swept-bounds recording) followed by per-state
+dispatch and the transition conditions.
 """
 
 import math
@@ -28,7 +28,7 @@ class Sequencer:
         self.skills = skills
         self.deliberator = None   # wired by the agent (circular dependency)
 
-    # ---- timing helpers (verbatim semantics) ----------------------------
+    # ---- timing helpers -------------------------------------------------
     def elapsed_in_state(self) -> float:
         return self.io.elapsed_since(self.wm.state_start_time)
 
@@ -44,9 +44,9 @@ class Sequencer:
         self.io.log_info(f"State changed to {new_state}")
 
     def enter_avoid_front(self, reason: str = ""):
-        """Reactive front-obstacle interrupt. A skill calls this exactly where
-        the original called enter_avoid_front; the from-state is always the
-        currently-active skill, so we resume it when avoidance completes."""
+        """Reactive front-obstacle interrupt a skill may trigger. The from-state
+        is always the currently-active skill, so we resume it when avoidance
+        completes."""
         wm = self.wm
         wm.avoid_previous_state = wm.state
         wm.avoid_phase = "BACKUP"

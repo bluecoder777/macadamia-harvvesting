@@ -2,13 +2,12 @@
 """World model: the shared blackboard for the 3T architecture.
 
 Holds every piece of mutable state, sensor cache and tunable parameter the
-three tiers read and write. The values below are the *defaults* and the fixed
-tunings, identical to the original ``SimpleRowFollower.__init__``. The agent
-(ROS node) re-reads the declared ROS parameters at start-up and overrides the
-parameter-backed fields, so launch-time overrides (``-p start_side:=left``
-etc.) behave exactly as before. Constructing a ``WorldModel`` on its own (no
-ROS) therefore reproduces the default-parameter robot, which is what the
-offline tests rely on.
+three tiers read and write. The values below are the defaults and fixed
+tunings; the agent (ROS node) re-reads the declared ROS parameters at start-up
+and overrides the parameter-backed fields, so launch-time overrides
+(``-p start_side:=left`` etc.) take effect. Constructing a ``WorldModel`` on
+its own (no ROS) gives the default-parameter robot, which is what the offline
+tests rely on.
 """
 
 import math
